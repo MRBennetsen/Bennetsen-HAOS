@@ -57,20 +57,16 @@ install_host_deps() {
         fi
     done
 
-    if [ ${#missing[@]} -gt 0 ] \
-        || [ ! -d /usr/lib/grub/x86_64-efi ] \
-        || [ ! -f /usr/lib/ISOLINUX/isolinux.bin ] \
-        || [ ! -f /usr/lib/ISOLINUX/isohdpfx.bin ] \
-        || [ ! -f /usr/lib/syslinux/modules/bios/ldlinux.c32 ]; then
+    if [ ${#missing[@]} -gt 0 ] || [ ! -d /usr/lib/grub/x86_64-efi ]; then
         if command -v apt-get >/dev/null 2>&1; then
             log "Installing missing host build tools via apt-get..."
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
             apt-get install -y -qq \
                 xorriso mtools dosfstools grub2-common grub-efi-amd64-bin \
-                isolinux syslinux-common cpio gzip xz-utils curl jq tar ca-certificates
+                cpio gzip xz-utils curl jq tar ca-certificates
         else
-            err "Missing required host commands/files: ${missing[*]}. Please install xorriso, mtools, dosfstools, grub2-common, grub-efi-amd64-bin, isolinux, syslinux-common, cpio, gzip, xz, curl."
+            err "Missing required host commands/files: ${missing[*]}. Please install xorriso, mtools, dosfstools, grub2-common, grub-efi-amd64-bin, cpio, gzip, xz, curl."
         fi
     fi
     ok "Host build dependencies verified."
@@ -216,9 +212,15 @@ EOF
 
     local kmod_dir="${ROOTFS_DIR}/lib/modules/${kver}/kernel"
     if [ -d "$kmod_dir" ]; then
-        log "Pruning unused GPU/media/watchdog/sound/SAN kernel modules..."
+        log "Pruning bulky vendor GPU/media/watchdog/sound/SAN kernel modules (keeping simpledrm)..."
         rm -rf \
-            "${kmod_dir}/drivers/gpu" \
+            "${kmod_dir}/drivers/gpu/drm/amd" \
+            "${kmod_dir}/drivers/gpu/drm/nouveau" \
+            "${kmod_dir}/drivers/gpu/drm/i915" \
+            "${kmod_dir}/drivers/gpu/drm/radeon" \
+            "${kmod_dir}/drivers/gpu/drm/xe" \
+            "${kmod_dir}/drivers/gpu/drm/msm" \
+            "${kmod_dir}/drivers/gpu/drm/tegra" \
             "${kmod_dir}/drivers/media" \
             "${kmod_dir}/drivers/watchdog" \
             "${kmod_dir}/drivers/infiniband" \
@@ -357,10 +359,10 @@ EOF
     ok "Live rootfs init & tty1 launcher configured."
 }
 
-# --- Step 4: Pack Kernel, Initramfs & Self-Contained UEFI + ISOLINUX Hybrid ISO ---
+# --- Step 4: Pack Kernel, Initramfs & Pure UEFI ISO ---
 package_iso() {
     log "Packing kernel and gzip RAM-root initramfs..."
-    mkdir -p "${ISO_DIR}/boot" "${ISO_DIR}/EFI/BOOT" "${ISO_DIR}/isolinux"
+    mkdir -p "${ISO_DIR}/boot" "${ISO_DIR}/EFI/BOOT"
 
     # Copy Alpine LTS kernel
     [ -f "${ROOTFS_DIR}/boot/vmlinuz-lts" ] || err "vmlinuz-lts missing from rootfs!"
@@ -398,37 +400,12 @@ package_iso() {
     mmd -i "$efiboot_img" ::/EFI ::/EFI/BOOT
     mcopy -i "$efiboot_img" "${ISO_DIR}/EFI/BOOT/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
 
-    # 3) Configure ISOLINUX for Legacy BIOS boot (cleanly boots into Easy-HAOS Legacy BIOS warning screen)
-    log "Configuring ISOLINUX Legacy BIOS bootloader..."
-    cp /usr/lib/ISOLINUX/isolinux.bin "${ISO_DIR}/isolinux/isolinux.bin"
-    cp /usr/lib/syslinux/modules/bios/ldlinux.c32 "${ISO_DIR}/isolinux/ldlinux.c32"
-    cat > "${ISO_DIR}/isolinux/isolinux.cfg" << 'EOF'
-DEFAULT easyhaos
-TIMEOUT 30
-PROMPT 1
-
-LABEL easyhaos
-  KERNEL /boot/vmlinuz
-  APPEND initrd=/boot/initrd.img nomodeset console=tty0 console=tty1 loglevel=4 panic=30
-
-LABEL debug
-  KERNEL /boot/vmlinuz
-  APPEND initrd=/boot/initrd.img nomodeset console=tty0 console=tty1 loglevel=7 ignore_loglevel panic=30
-EOF
-
-    # 4) Build hybrid UEFI + Legacy BIOS ISO using xorriso directly
-    log "Generating hybrid UEFI+BIOS bootable ISO: ${OUTPUT_ISO}..."
+    # 3) Build pure UEFI bootable ISO using xorriso directly (no Legacy BIOS / Syslinux popups)
+    log "Generating UEFI bootable ISO: ${OUTPUT_ISO}..."
     rm -f "$OUTPUT_ISO"
     xorriso -as mkisofs \
         -o "$OUTPUT_ISO" \
         -volid "EASY_HAOS" \
-        -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
-        -c isolinux/boot.cat \
-        -b isolinux/isolinux.bin \
-        -no-emul-boot \
-        -boot-load-size 4 \
-        -boot-info-table \
-        -eltorito-alt-boot \
         -e boot/efiboot.img \
         -no-emul-boot \
         -isohybrid-gpt-basdat \
