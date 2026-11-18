@@ -1,0 +1,165 @@
+name: Build & Release Easy-HAOS ISO
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Publish GitHub Release (creates a release if set to true)'
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Tag name when publishing via workflow_dispatch (e.g. v1.0.0)'
+        required: false
+        default: 'v1.0.0'
+        type: string
+      release_notes:
+        description: 'Custom "What is New" summary for this release (optional)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-iso:
+    name: Build Hybrid UEFI+BIOS Live ISO
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install ISO build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xorriso \
+            mtools \
+            grub2-common \
+            grub-pc-bin \
+            grub-efi-amd64-bin \
+            cpio \
+            xz-utils \
+            curl \
+            jq \
+            tar \
+            ca-certificates
+
+      - name: Build Easy-HAOS ISO
+        # "If this CI job turns green, I take full credit. If it fails, blame Alpine mirrors."
+        run: |
+          chmod +x build/build-iso.sh src/installer.sh src/easy-haos-autostart.sh
+          sudo ./build/build-iso.sh
+
+      - name: Generate Checksums (SHA256SUMS)
+        run: |
+          ls -lh easy-haos-installer-x86_64.iso
+          sha256sum easy-haos-installer-x86_64.iso > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate Release Notes & Metadata
+        id: release_meta
+        env:
+          CUSTOM_NOTES: ${{ github.event.inputs.release_notes }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          ISO_FILE="easy-haos-installer-x86_64.iso"
+          ISO_SIZE=$(du -h "$ISO_FILE" | cut -f1)
+          ISO_SHA256=$(awk '{print $1}' SHA256SUMS)
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            CURRENT_TAG="${GITHUB_REF_NAME}"
+          else
+            CURRENT_TAG="${INPUT_TAG}"
+          fi
+
+          # Find previous tag to collect commits since last release
+          PREV_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -n 1 || true)
+          TAG_MSG=$(git tag -l --format='%(contents)' "${CURRENT_TAG}" 2>/dev/null || true)
+
+          if [ -n "$PREV_TAG" ]; then
+            COMMIT_LOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges || true)
+          else
+            COMMIT_LOG=$(git log HEAD --pretty=format:"- %s (%h)" --no-merges -n 25 || true)
+          fi
+
+          {
+            echo "## Easy-HAOS Bare-Metal Auto-Installer (\`${ISO_FILE}\`)"
+            echo ""
+            echo '> *"We need to make a Home Assistant bootable USB - It cant be that hard. I'"'"'m gonna regret this aren'"'"'t i?"* — Christian Bennetsen'
+            echo ""
+            echo "### What's New in ${CURRENT_TAG}"
+            if [ -n "$CUSTOM_NOTES" ]; then
+              echo ""
+              echo "$CUSTOM_NOTES"
+            fi
+            if [ -n "$TAG_MSG" ]; then
+              echo ""
+              echo "$TAG_MSG"
+            fi
+            if [ -n "$COMMIT_LOG" ]; then
+              echo ""
+              echo "#### Changes Included"
+              echo "$COMMIT_LOG"
+            elif [ -z "$CUSTOM_NOTES" ] && [ -z "$TAG_MSG" ]; then
+              echo ""
+              echo "- Initial automated build and release of Easy-HAOS."
+            fi
+            echo ""
+            echo "### Build & Artifact Verification"
+            echo "| Field | Value |"
+            echo "| :--- | :--- |"
+            echo "| **ISO Filename** | \`${ISO_FILE}\` |"
+            echo "| **ISO Size** | ${ISO_SIZE} |"
+            echo "| **Build Date** | ${BUILD_DATE} |"
+            echo "| **Base OS** | Alpine Linux x86_64 (GRUB2 UEFI + Legacy BIOS Hybrid) |"
+            echo "| **SHA-256 Checksum** | \`${ISO_SHA256}\` |"
+            echo ""
+            echo "### Quick Start"
+            echo "1. Download \`${ISO_FILE}\` and verify its SHA-256 hash against \`SHA256SUMS\`."
+            echo "2. Flash to a USB stick using **BalenaEtcher**, **Rufus** (ISO or DD mode), or drop onto a **Ventoy** USB stick."
+            echo "3. Boot your Mini PC (Intel N100, NUC, Lenovo Tiny, Dell OptiPlex, etc.) in **UEFI mode** (with Secure Boot disabled)."
+            echo "4. Follow the on-screen **Easy-HAOS** wizard!"
+            echo ""
+            echo "---"
+            echo "**Maintained by Christian Bennetsen**"
+            echo "- Website: https://bennetsen.dk"
+            echo "- Email: christian@bennetsen.dk"
+            echo "- YouTube: https://www.youtube.com/@BennetsenTech"
+            echo "- LinkedIn: https://www.linkedin.com/in/mrbennetsen/"
+          } > RELEASE_NOTES.md
+
+          echo "tag_name=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+          cat RELEASE_NOTES.md
+
+      - name: Upload ISO & Checksum Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: easy-haos-installer-x86_64
+          path: |
+            easy-haos-installer-x86_64.iso
+            SHA256SUMS
+            RELEASE_NOTES.md
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release == true)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
+          name: "Easy-HAOS Installer ${{ steps.release_meta.outputs.tag_name }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          files: |
+            easy-haos-installer-x86_64.iso
+            SHA256SUMS
