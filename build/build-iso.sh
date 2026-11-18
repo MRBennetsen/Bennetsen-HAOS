@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  _____                 _    _             ____   _____ 
-# | ____|__ _ ___ _   _ | |  | | __ _  ___ / ___| | ____|
-# |  _| / _` / __| | | || |__| |/ _` |/ _ \___ \ |  _|  
-# | |__| (_| \__ \ |_| ||  __  | (_| | (_) |___) || |___ 
-# |_____\__,_|___/\__, ||_|  |_|\__,_|\___/|____/ |_____|
-#                 |___/                                   
+#  _____                 _   _    _    ___  ____  
+# | ____|__ _ ___ _   _ | | | |  / \  / _ \/ ___| 
+# |  _| / _` / __| | | || |_| | / _ \| | | \___ \ 
+# | |__| (_| \__ \ |_| ||  _  |/ ___ \ |_| |___) |
+# |_____\__,_|___/\__, ||_| |_/_/   \_\___/|____/ 
+#                 |___/                           
 #
-# Easy-HAOS ISO Builder (Alpine Linux x86_64 Hybrid UEFI+BIOS)
+# Easy-HAOS ISO Builder (Alpine Linux x86_64 Pure UEFI)
 #
 # Christian Bennetsen | https://bennetsen.dk | christian@bennetsen.dk
 # YouTube: https://www.youtube.com/@BennetsenTech
@@ -170,7 +170,8 @@ EOF
         iw \
         wireless-tools \
         ca-certificates \
-        kbd
+        kbd \
+        kbd-misc
 
     ok "Alpine rootfs packages installed."
 
@@ -193,6 +194,12 @@ EOF
         # Drop huge Intel 100GbE switch DDP (~60MB) & Bluetooth firmware (~15MB)
         rm -rf "${ROOTFS_DIR}/lib/firmware/intel/ice" \
                "${ROOTFS_DIR}/lib/firmware/intel/ibt"*
+    fi
+
+    # Keep only UTF-8 eurlatgr & default8x16 console fonts (~25KB) to preserve crisp TUI glyphs
+    if [ -d "${ROOTFS_DIR}/usr/share/consolefonts" ]; then
+        find "${ROOTFS_DIR}/usr/share/consolefonts" -type f \
+            ! -name 'eurlatgr*' ! -name 'default8x16*' -delete 2>/dev/null || true
     fi
 
     # Strip docs, caches, System.map, config, and unused initramfs backup

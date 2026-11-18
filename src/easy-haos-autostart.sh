@@ -9,13 +9,16 @@
 # ==============================================================================
 
 export TERM="${TERM:-linux}"
+export LANG="C.UTF-8"
+export LC_ALL="C.UTF-8"
+
+# Enable UTF-8 mode and load Unicode-capable Linux console font (✓, ✗, ┌─┐, █)
+kbd_mode -u 2>/dev/null || printf '\033%%G'
+setfont eurlatgr 2>/dev/null || setfont default8x16 2>/dev/null || true
 
 # Ensure cursor is visible and clear boot messages
 setterm -cursor on 2>/dev/null || true
 clear
-
-# Load readable console font if available
-setfont Lat15-TerminusBold16 2>/dev/null || setfont default8x16 2>/dev/null || true
 
 while true; do
     if [ -x /usr/local/bin/installer.sh ]; then

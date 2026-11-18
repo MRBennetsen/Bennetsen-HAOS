@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  _____                 _    _             ____   _____ 
-# | ____|__ _ ___ _   _ | |  | | __ _  ___ / ___| | ____|
-# |  _| / _` / __| | | || |__| |/ _` |/ _ \___ \ |  _|  
-# | |__| (_| \__ \ |_| ||  __  | (_| | (_) |___) || |___ 
-# |_____\__,_|___/\__, ||_|  |_|\__,_|\___/|____/ |_____|
-#                 |___/                                   
+#  _____                 _   _    _    ___  ____  
+# | ____|__ _ ___ _   _ | | | |  / \  / _ \/ ___| 
+# |  _| / _` / __| | | || |_| | / _ \| | | \___ \ 
+# | |__| (_| \__ \ |_| ||  _  |/ ___ \ |_| |___) |
+# |_____\__,_|___/\__, ||_| |_/_/   \_\___/|____/ 
+#                 |___/                           
 #
 # Easy-HAOS: Foolproof Home Assistant OS (x86-64) Bare-Metal Installer
 #
@@ -21,6 +21,10 @@
 
 set -uo pipefail
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export LANG="${LANG:-C.UTF-8}"
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+
 # --- ANSI Colors & Formatting ---
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
@@ -32,11 +36,12 @@ C_BLUE="\033[1;34m"
 C_CYAN="\033[1;36m"
 C_WHITE="\033[1;37m"
 C_BG_RED="\033[41m"
-
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+C_BG_GREEN="\033[42m"
+C_BG_CYAN="\033[46m"
+C_BLACK="\033[30m"
 
 # --- Global State ---
-HAOS_LATEST_API="https://api.github.com/repos/home-assistant/operating-system/releases/latest"
+HAOS_LATEST_API="https://api.github.com/repos/home-assistant/operating-system/releases?per_page=10"
 HAOS_VERSION=""
 HAOS_DOWNLOAD_URL=""
 HAOS_ASSET_SIZE=""
@@ -46,6 +51,23 @@ TARGET_DISK=""
 TARGET_SIZE=""
 TARGET_MODEL=""
 PROTECTED_DISKS=()
+CLOCK_SYNCED=false
+CURRENT_STEP=1
+ERR_LOG="/tmp/easyhaos_err.log"
+RETRY_REQUESTED=false
+
+# Live Diagnostic Panel States: pending | running | ok | warn | fail
+DIAG_UEFI_ST="pending";   DIAG_UEFI_MSG="Waiting to inspect firmware..."
+DIAG_SB_ST="pending";     DIAG_SB_MSG="Waiting to check Secure Boot..."
+DIAG_NET_ST="pending";    DIAG_NET_MSG="Waiting to verify network & clock..."
+DIAG_REL_ST="pending";    DIAG_REL_MSG="Waiting to resolve HAOS release..."
+DIAG_USB_ST="pending";    DIAG_USB_MSG="Waiting to identify installer USB..."
+
+# Flash Dashboard States
+FLASH_S1_ST="pending"; FLASH_S1_MSG="Unmount existing target partitions"
+FLASH_S2_ST="pending"; FLASH_S2_MSG="Wipe partition signatures & GPT table"
+FLASH_S3_ST="pending"; FLASH_S3_MSG="Stream & flash Home Assistant OS"
+FLASH_S4_ST="pending"; FLASH_S4_MSG="Verify partitions & register UEFI BootOrder"
 
 # --- TUI Capability Detection ---
 # "Using gum if available, falling back to dialog/whiptail like it's 2003"
@@ -58,35 +80,156 @@ elif command -v whiptail >/dev/null 2>&1; then
     TUI_BACKEND="whiptail"
 fi
 
-# --- Helper: Banner ---
-print_banner() {
-    clear
-    cat << "EOF"
-  _____                 _    _             ____   _____ 
- | ____|__ _ ___ _   _ | |  | | __ _  ___ / ___| | ____|
- |  _| / _` / __| | | || |__| |/ _` |/ _ \___ \ |  _|  
- | |__| (_| \__ \ |_| ||  __  | (_| | (_) |___) || |___ 
- |_____\__,_|___/\__, ||_|  |_|\__,_|\___/|____/ |_____|
-                 |___/                                   
-EOF
-    echo -e "${C_CYAN} Home Assistant OS (Generic x86-64) Bare-Metal Auto-Installer${C_RESET}"
-    echo -e "${C_DIM} Christian Bennetsen | https://bennetsen.dk | christian@bennetsen.dk${C_RESET}"
-    echo -e "${C_DIM} YouTube: @BennetsenTech | LinkedIn: /in/mrbennetsen${C_RESET}"
-    echo -e "${C_BLUE}======================================================================${C_RESET}"
+reset_wizard_state() {
+    HAOS_VERSION=""
+    HAOS_DOWNLOAD_URL=""
+    HAOS_ASSET_SIZE=""
+    HAOS_IMAGE_FILE=""
+    IS_OFFLINE_IMAGE=false
+    TARGET_DISK=""
+    TARGET_SIZE=""
+    TARGET_MODEL=""
+    PROTECTED_DISKS=()
+    CURRENT_STEP=1
+    RETRY_REQUESTED=false
+    : > "$ERR_LOG"
+
+    DIAG_UEFI_ST="pending";   DIAG_UEFI_MSG="Waiting to inspect firmware..."
+    DIAG_SB_ST="pending";     DIAG_SB_MSG="Waiting to check Secure Boot..."
+    DIAG_NET_ST="pending";    DIAG_NET_MSG="Waiting to verify network & clock..."
+    DIAG_REL_ST="pending";    DIAG_REL_MSG="Waiting to resolve HAOS release..."
+    DIAG_USB_ST="pending";    DIAG_USB_MSG="Waiting to identify installer USB..."
+
+    FLASH_S1_ST="pending"; FLASH_S1_MSG="Unmount existing target partitions"
+    FLASH_S2_ST="pending"; FLASH_S2_MSG="Wipe partition signatures & GPT table"
+    FLASH_S3_ST="pending"; FLASH_S3_MSG="Stream & flash Home Assistant OS"
+    FLASH_S4_ST="pending"; FLASH_S4_MSG="Verify partitions & register UEFI BootOrder"
 }
 
-# --- Helper: Fatal Error ---
-fatal_error() {
-    local msg="$1"
-    echo -e "\n${C_BG_RED}${C_WHITE} FATAL ERROR ${C_RESET} ${C_RED}${msg}${C_RESET}\n"
-    # "Dropping to emergency bash prompt - I'm gonna regret this aren't I?"
-    echo -e "${C_YELLOW}Press [ENTER] to drop to an emergency shell, or type 'reboot' to restart.${C_RESET}"
-    read -r reply
-    if [[ "${reply,,}" == "reboot" ]]; then
-        sync
-        reboot -f
+# ==============================================================================
+# TUI RENDERING PRIMITIVES (Optimized for eurlatgr UTF-8 Framebuffer Console)
+# ==============================================================================
+
+status_badge() {
+    local st="$1"
+    case "$st" in
+        ok)      echo -ne "${C_GREEN}[ ✓ ]${C_RESET}" ;;
+        warn)    echo -ne "${C_YELLOW}[ ! ]${C_RESET}" ;;
+        fail)    echo -ne "${C_RED}[ ✗ ]${C_RESET}" ;;
+        running) echo -ne "${C_CYAN}[ → ]${C_RESET}" ;;
+        *)       echo -ne "${C_DIM}[ · ]${C_RESET}" ;;
+    esac
+}
+
+render_wizard_bar() {
+    local active="$1"
+    local labels=("1.Pre-Flight" "2.Release" "3.Disk" "4.Flash" "5.Done")
+    local bar=""
+    local i=1
+
+    for lbl in "${labels[@]}"; do
+        if [ "$i" -lt "$active" ]; then
+            bar+="${C_GREEN}[✓] ${lbl}${C_RESET}"
+        elif [ "$i" -eq "$active" ]; then
+            bar+="${C_BG_CYAN}${C_BLACK}${C_BOLD} → ${lbl} ${C_RESET}"
+        else
+            bar+="${C_DIM}[·] ${lbl}${C_RESET}"
+        fi
+        if [ "$i" -lt 5 ]; then
+            bar+=" ${C_DIM}→${C_RESET} "
+        fi
+        i=$((i + 1))
+    done
+    echo -e "  ${bar}"
+}
+
+print_banner() {
+    local step="${1:-$CURRENT_STEP}"
+    CURRENT_STEP="$step"
+    clear
+    echo -e "${C_CYAN}"
+    cat << "EOF"
+  _____                 _   _    _    ___  ____  
+ | ____|__ _ ___ _   _ | | | |  / \  / _ \/ ___| 
+ |  _| / _` / __| | | || |_| | / _ \| | | \___ \ 
+ | |__| (_| \__ \ |_| ||  _  |/ ___ \ |_| |___) |
+ |_____\__,_|___/\__, ||_| |_/_/   \_\___/|____/ 
+                 |___/                           
+EOF
+    echo -e "${C_RESET}${C_WHITE}${C_BOLD}  Home Assistant OS (x86-64) Bare-Metal Appliance Installer${C_RESET}"
+    echo -e "${C_DIM}  Christian Bennetsen | bennetsen.dk | christian@bennetsen.dk | @BennetsenTech${C_RESET}"
+    echo -e "${C_BLUE}──────────────────────────────────────────────────────────────────────────────${C_RESET}"
+    render_wizard_bar "$step"
+    echo -e "${C_BLUE}──────────────────────────────────────────────────────────────────────────────${C_RESET}\n"
+}
+
+ui_card() {
+    local border_fg="$1"
+    local title="$2"
+    local body="$3"
+    local border_style="${4:-normal}"
+
+    if [ "$TUI_BACKEND" = "gum" ]; then
+        gum style \
+            --border "$border_style" \
+            --border-foreground "$border_fg" \
+            --padding "0 2" \
+            --margin "0 2" \
+            --width 74 \
+            "$(echo -e "${C_BOLD}${title}${C_RESET}\n${body}")"
+    else
+        echo -e "  ┌─[ ${C_BOLD}${title}${C_RESET} ]──────────────────────────────────────────────────────────"
+        while IFS= read -r line; do
+            echo -e "  │  ${line}"
+        done <<< "$body"
+        echo -e "  └──────────────────────────────────────────────────────────────────────────"
     fi
-    exec /bin/bash
+}
+
+render_diagnostics_card() {
+    local lines=""
+    lines+="$(status_badge "$DIAG_UEFI_ST")  ${C_WHITE}UEFI Firmware     ${C_RESET} ${DIAG_UEFI_MSG}\n"
+    lines+="$(status_badge "$DIAG_SB_ST")  ${C_WHITE}Secure Boot       ${C_RESET} ${DIAG_SB_MSG}\n"
+    lines+="$(status_badge "$DIAG_NET_ST")  ${C_WHITE}Network & Clock   ${C_RESET} ${DIAG_NET_MSG}\n"
+    lines+="$(status_badge "$DIAG_REL_ST")  ${C_WHITE}HAOS x86-64 Image ${C_RESET} ${DIAG_REL_MSG}\n"
+    lines+="$(status_badge "$DIAG_USB_ST")  ${C_WHITE}USB Safety Lock   ${C_RESET} ${DIAG_USB_MSG}"
+
+    ui_card "39" "System Pre-Flight & Diagnostics" "$(echo -e "$lines")" "normal"
+}
+
+render_flash_card() {
+    local lines=""
+    lines+="$(status_badge "$FLASH_S1_ST")  ${FLASH_S1_MSG}\n"
+    lines+="$(status_badge "$FLASH_S2_ST")  ${FLASH_S2_MSG}\n"
+    lines+="$(status_badge "$FLASH_S3_ST")  ${FLASH_S3_MSG}\n"
+    lines+="$(status_badge "$FLASH_S4_ST")  ${FLASH_S4_MSG}"
+
+    local header="Flashing /dev/${TARGET_DISK} (${TARGET_MODEL} - ${TARGET_SIZE})"
+    ui_card "39" "$header" "$(echo -e "$lines")" "normal"
+}
+
+# Animate a smooth pulse bar while a background subshell/command executes
+# Supports passing a shell function OR external command; writes exit code cleanly.
+run_animated() {
+    local title="$1"
+    shift
+    local frames=("[█░░░]" "[░█░░]" "[░░█░]" "[░░░█]" "[░░█░]" "[░█░░]")
+    local idx=0
+
+    "$@" 2>>"$ERR_LOG" &
+    local pid=$!
+
+    tput civis 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  ${C_CYAN}%s${C_RESET}  %s\033[K" "${frames[$idx]}" "$title"
+        idx=$(( (idx + 1) % ${#frames[@]} ))
+        sleep 0.12
+    done
+    wait "$pid"
+    local rc=$?
+    tput cnorm 2>/dev/null || true
+    printf "\r\033[K"
+    return "$rc"
 }
 
 # --- Helper: Interactive Choice Menu ---
@@ -97,7 +240,11 @@ tui_choose() {
 
     case "$TUI_BACKEND" in
         gum)
-            printf '%s\n' "${options[@]}" | gum choose --header "$header"
+            printf '%s\n' "${options[@]}" | gum choose \
+                --cursor="→ " \
+                --cursor.foreground="51" \
+                --header.foreground="15" \
+                --header "  $header"
             ;;
         dialog)
             local dialog_args=()
@@ -124,13 +271,13 @@ tui_choose() {
             echo "${options[$((chosen_idx - 1))]}"
             ;;
         *)
-            echo -e "${C_WHITE}${C_BOLD}${header}${C_RESET}" >&2
+            echo -e "  ${C_WHITE}${C_BOLD}${header}${C_RESET}" >&2
             local idx=1
             for opt in "${options[@]}"; do
-                echo -e "  ${C_CYAN}${idx})${C_RESET} ${opt}" >&2
+                echo -e "    ${C_CYAN}${idx})${C_RESET} ${opt}" >&2
                 idx=$((idx + 1))
             done
-            echo -ne "\nSelect option [1-${#options[@]}]: " >&2
+            echo -ne "\n  Select option [1-${#options[@]}]: " >&2
             local choice_idx
             read -r choice_idx
             if [[ "$choice_idx" =~ ^[0-9]+$ ]] && [ "$choice_idx" -ge 1 ] && [ "$choice_idx" -le "${#options[@]}" ]; then
@@ -142,31 +289,67 @@ tui_choose() {
     esac
 }
 
-# --- Helper: Confirmation Prompt ---
-tui_confirm() {
-    local prompt="$1"
-    case "$TUI_BACKEND" in
-        gum)
-            gum confirm "$prompt"
-            ;;
-        dialog)
-            dialog --clear --title "Confirmation" --yesno "$prompt" 10 70 >/dev/tty
-            local rc=$?
-            clear
-            return $rc
-            ;;
-        whiptail)
-            whiptail --title "Confirmation" --yesno "$prompt" 10 70
-            local rc=$?
-            clear
-            return $rc
-            ;;
-        *)
-            echo -ne "${C_WHITE}${prompt} (y/N): ${C_RESET}"
-            read -r resp
-            [[ "$resp" =~ ^[Yy]$ ]]
-            ;;
-    esac
+# --- Helper: Red [ ✗ ] Diagnostic Failure Screen & Recovery Menu ---
+# "Dropping to red diagnostic GUI - I'm gonna regret this aren't I?"
+fatal_error() {
+    local title="$1"
+    local reason="${2:-$1}"
+    shift 2 2>/dev/null || shift $#
+
+    local hints=("$@")
+    local err_snippet=""
+    if [ -s "$ERR_LOG" ]; then
+        err_snippet=$(tail -n 6 "$ERR_LOG" | sed 's/^/    /')
+    fi
+
+    while true; do
+        print_banner "$CURRENT_STEP"
+
+        local body=""
+        body+="${C_RED}${C_BOLD}[ ✗ ] FAILURE:${C_RESET} ${C_WHITE}${reason}${C_RESET}\n"
+
+        if [ -n "$err_snippet" ]; then
+            body+="\n${C_YELLOW}Diagnostic Log Output:${C_RESET}\n${C_DIM}${err_snippet}${C_RESET}\n"
+        fi
+
+        if [ ${#hints[@]} -gt 0 ]; then
+            body+="\n${C_CYAN}Recommended Actions:${C_RESET}\n"
+            for h in "${hints[@]}"; do
+                body+="  • ${h}\n"
+            done
+        fi
+
+        ui_card "196" "[ ✗ ] DIAGNOSTIC ERROR: ${title}" "$(echo -e "$body")" "double"
+        echo ""
+
+        local action
+        action=$(tui_choose "Choose how to recover:" \
+            "Retry Installation Wizard" \
+            "Configure Network / Wi-Fi" \
+            "Open Diagnostic Shell (bash)" \
+            "Reboot Machine") || continue
+
+        case "$action" in
+            "Retry Installation Wizard")
+                RETRY_REQUESTED=true
+                return 0
+                ;;
+            "Configure Network / Wi-Fi")
+                setup_wifi_connection || renew_ethernet_dhcp || true
+                RETRY_REQUESTED=true
+                return 0
+                ;;
+            "Open Diagnostic Shell (bash)")
+                clear
+                echo -e "${C_CYAN}Easy-HAOS Diagnostic Shell — type 'exit' to return to recovery menu.${C_RESET}\n"
+                /bin/bash
+                ;;
+            "Reboot Machine")
+                sync
+                reboot -f
+                ;;
+        esac
+    done
 }
 
 # ==============================================================================
@@ -174,62 +357,57 @@ tui_confirm() {
 # ==============================================================================
 # Checking UEFI mode - "Please don't be running BIOS from 1998, HAOS will cry"
 check_uefi_mode() {
-    echo -e "${C_CYAN}[*] Inspecting firmware boot mode...${C_RESET}"
+    DIAG_UEFI_ST="running"; DIAG_UEFI_MSG="Inspecting /sys/firmware/efi..."
+    print_banner 1
+    render_diagnostics_card
+    echo ""
+
+    run_animated "Checking UEFI boot mode..." sleep 0.4
+
     if [ ! -d /sys/firmware/efi ]; then
-        clear
-        echo -e "${C_BG_RED}${C_WHITE}${C_BOLD} CRITICAL BOOT ERROR: LEGACY / CSM BIOS MODE DETECTED ${C_RESET}\n"
-        cat << "EOF"
-  _   _ _____ _____ ___   ____  _____ ___  _   _ ___ ____  _____ ____  
- | | | | ____|  ___|_ _| |  _ \| ____/ _ \| | | |_ _|  _ \| ____|  _ \ 
- | | | |  _| | |_   | |  | |_) |  _|| | | | | | || || |_) |  _| | | | |
- | |_| | |___|  _|  | |  |  _ <| |__| |_| | |_| || ||  _ <| |___| |_| |
-  \___/|_____|_|   |___| |_| \_\_____\__\_\\___/|___|_| \_\_____|____/ 
-EOF
-        echo -e "\n${C_RED}${C_BOLD}Home Assistant OS Generic x86-64 STRICTLY requires UEFI boot mode!${C_RESET}"
-        echo -e "${C_YELLOW}Your machine booted in Legacy / CSM mode and cannot boot HAOS after install.${C_RESET}\n"
-        echo -e "${C_WHITE}${C_BOLD}How to enable UEFI in your BIOS:${C_RESET}"
-        echo -e "  1. Reboot your PC and press ${C_CYAN}Del${C_RESET}, ${C_CYAN}F2${C_RESET}, ${C_CYAN}F10${C_RESET}, or ${C_CYAN}F12${C_RESET} to enter BIOS Setup."
-        echo -e "  2. Open the ${C_CYAN}Boot${C_RESET} or ${C_CYAN}Advanced${C_RESET} tab."
-        echo -e "  3. ${C_GREEN}ENABLE UEFI Boot${C_RESET} and ${C_RED}DISABLE CSM / Legacy Boot${C_RESET}."
-        echo -e "  4. Save & Exit (${C_CYAN}F10${C_RESET}) and boot from the ${C_CYAN}UEFI:${C_RESET} entry for this USB drive.\n"
-        echo -e "${C_DIM}Need help? Visit https://bennetsen.dk or youtube.com/@BennetsenTech${C_RESET}\n"
+        DIAG_UEFI_ST="fail"; DIAG_UEFI_MSG="${C_RED}Legacy / CSM BIOS mode detected (UEFI required)${C_RESET}"
+        print_banner 1
+        render_diagnostics_card
+        echo ""
+
+        local msg=""
+        msg+="${C_RED}${C_BOLD}[ ✗ ] Home Assistant OS strictly requires UEFI boot mode.${C_RESET}\n\n"
+        msg+="Your computer booted in Legacy/CSM mode and cannot boot HAOS after flashing.\n\n"
+        msg+="${C_WHITE}How to fix in BIOS:${C_RESET}\n"
+        msg+="  1. Reboot and press ${C_CYAN}Del${C_RESET}, ${C_CYAN}F2${C_RESET}, ${C_CYAN}F10${C_RESET}, or ${C_CYAN}F12${C_RESET} to open BIOS Setup.\n"
+        msg+="  2. Open the ${C_CYAN}Boot${C_RESET} tab: ${C_GREEN}Enable UEFI Boot${C_RESET} and ${C_RED}Disable CSM / Legacy${C_RESET}.\n"
+        msg+="  3. Save (F10) and select the ${C_CYAN}UEFI:${C_RESET} entry for this USB drive."
+
+        ui_card "196" "[ ✗ ] UEFI BOOT REQUIRED" "$(echo -e "$msg")" "double"
+        echo ""
 
         while true; do
-            echo -ne "${C_YELLOW}Type 'reboot', 'poweroff', or 'shell': ${C_RESET}"
-            if ! read -r choice; then
-                sleep 1
-                continue
-            fi
-            case "${choice,,}" in
-                reboot)
-                    echo -e "${C_YELLOW}Rebooting so you can switch BIOS to UEFI...${C_RESET}"
-                    sync
-                    reboot -f || poweroff -f || halt -f
-                    exit 1
-                    ;;
-                poweroff|halt)
-                    echo -e "${C_YELLOW}Powering off safely...${C_RESET}"
-                    sync
-                    poweroff -f || halt -f
-                    exit 1
-                    ;;
-                shell)
-                    exec /bin/bash
-                    ;;
-                *)
-                    echo -e "${C_RED}Please type 'reboot', 'poweroff', or 'shell'.${C_RESET}"
-                    ;;
+            local bios_action
+            bios_action=$(tui_choose "Firmware Action:" \
+                "Reboot Machine to Enter BIOS" \
+                "Power Off Machine" \
+                "Open Diagnostic Shell (bash)") || continue
+            case "$bios_action" in
+                "Reboot Machine to Enter BIOS") sync; reboot -f ;;
+                "Power Off Machine") sync; poweroff -f ;;
+                "Open Diagnostic Shell (bash)") /bin/bash ;;
             esac
         done
     fi
-    echo -e "${C_GREEN}[✓] UEFI Mode verified (/sys/firmware/efi present).${C_RESET}"
+
+    DIAG_UEFI_ST="ok"; DIAG_UEFI_MSG="${C_GREEN}Active (Modern EFI firmware verified)${C_RESET}"
 }
 
 # Secure Boot check - "Microsoft says no, but we say disable it"
 check_secure_boot() {
-    echo -e "${C_CYAN}[*] Checking Secure Boot status...${C_RESET}"
-    local sb_active=false
+    DIAG_SB_ST="running"; DIAG_SB_MSG="Reading EFI SecureBoot variables..."
+    print_banner 1
+    render_diagnostics_card
+    echo ""
 
+    run_animated "Checking Secure Boot status..." sleep 0.3
+
+    local sb_active=false
     if command -v mokutil >/dev/null 2>&1; then
         if mokutil --sb-state 2>/dev/null | grep -iq "enabled"; then
             sb_active=true
@@ -251,44 +429,46 @@ check_secure_boot() {
     fi
 
     if [ "$sb_active" = true ]; then
-        echo -e "\n${C_YELLOW}╔══════════════════════════════════════════════════════════════════════╗${C_RESET}"
-        echo -e "${C_YELLOW}║                   ${C_RED}${C_BOLD}WARNING: SECURE BOOT IS ENABLED${C_RESET}${C_YELLOW}                    ║${C_RESET}"
-        echo -e "${C_YELLOW}╚══════════════════════════════════════════════════════════════════════╝${C_RESET}"
-        echo -e "${C_WHITE}Home Assistant OS requires Secure Boot to be DISABLED in BIOS.${C_RESET}"
-        echo -e "${C_YELLOW}Its bootloader is not signed with Microsoft Secure Boot keys, so your Mini PC${C_RESET}"
-        echo -e "${C_YELLOW}will fail to boot HAOS until you turn Secure Boot OFF in firmware settings.${C_RESET}\n"
+        DIAG_SB_ST="warn"; DIAG_SB_MSG="${C_YELLOW}ENABLED (HAOS requires Secure Boot OFF)${C_RESET}"
+        print_banner 1
+        render_diagnostics_card
+        echo ""
+
+        local sb_body=""
+        sb_body+="${C_YELLOW}${C_BOLD}[ ! ] Secure Boot is currently ENABLED in your BIOS.${C_RESET}\n\n"
+        sb_body+="Home Assistant OS is not signed with Microsoft Secure Boot keys.\n"
+        sb_body+="Your Mini PC will refuse to boot HAOS until you turn Secure Boot OFF."
+
+        ui_card "220" "[ ! ] SECURE BOOT WARNING" "$(echo -e "$sb_body")" "double"
+        echo ""
 
         local sb_choice
-        sb_choice=$(tui_choose "Secure Boot is currently ENABLED. What would you like to do?" \
-            "Reboot into BIOS / UEFI Firmware Setup to disable Secure Boot" \
-            "Continue anyway (I will disable Secure Boot right after flashing)" \
-            "Abort installation") || fatal_error "Secure Boot check aborted."
+        sb_choice=$(tui_choose "How would you like to proceed?" \
+            "Reboot into UEFI Firmware Setup to Disable Secure Boot" \
+            "Continue Anyway (I will disable Secure Boot after flashing)" \
+            "Abort & Open Recovery Menu") || sb_choice="Abort"
 
         case "$sb_choice" in
-            "Reboot into BIOS / UEFI Firmware Setup to disable Secure Boot")
-                echo -e "${C_CYAN}[*] Rebooting into UEFI Firmware Setup...${C_RESET}"
-                # Try firmware reboot if supported, fallback to normal reboot
+            "Reboot into UEFI Firmware Setup"*)
                 efibootmgr -n 0000 >/dev/null 2>&1 || true
-                if [ -w /sys/firmware/efi/efivars/OsIndications-8be4df61-93ca-11d2-aa0d-00e098032b8c ]; then
-                    echo -e "${C_DIM}(Rebooting now — press Del/F2/F10 if firmware does not open automatically)${C_RESET}"
-                fi
                 sync
                 reboot -f
-                exit 0
                 ;;
-            "Continue anyway"*)
-                echo -e "${C_YELLOW}[!] Proceeding with Secure Boot warning acknowledged.${C_RESET}"
+            "Continue Anyway"*)
+                DIAG_SB_ST="warn"; DIAG_SB_MSG="${C_YELLOW}Enabled (User acknowledged — disable after flash)${C_RESET}"
                 ;;
             *)
-                fatal_error "Aborted by user to disable Secure Boot in BIOS."
+                fatal_error "Secure Boot Enabled" \
+                    "Installation paused because Secure Boot is active in BIOS." \
+                    "Enter BIOS (F2/Del/F10) and set Secure Boot to Disabled." \
+                    "Boot Easy-HAOS again and select Install."
+                return 1
                 ;;
         esac
     else
-        echo -e "${C_GREEN}[✓] Secure Boot is Disabled (Ready for Home Assistant OS).${C_RESET}"
+        DIAG_SB_ST="ok"; DIAG_SB_MSG="${C_GREEN}Disabled (Optimal for Home Assistant OS)${C_RESET}"
     fi
 }
-
-CLOCK_SYNCED=false
 
 # Sync system clock on older Mini PCs with dead CMOS batteries so HTTPS TLS checks succeed
 sync_system_clock() {
@@ -301,7 +481,6 @@ sync_system_clock() {
     CLOCK_SYNCED=true
 }
 
-# Helper to verify connectivity
 has_internet() {
     if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
         sync_system_clock
@@ -311,10 +490,8 @@ has_internet() {
     fi
 }
 
-# Trigger DHCP across wired interfaces
 renew_ethernet_dhcp() {
-    echo -e "${C_CYAN}[*] Bringing up wired Ethernet interfaces & requesting DHCP...${C_RESET}"
-    for iface in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(eth|en|eno|enp)'); do
+    for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(eth|en|eno|enp)'); do
         ip link set "$iface" up 2>/dev/null || true
         if command -v dhcpcd >/dev/null 2>&1; then
             dhcpcd -n "$iface" >/dev/null 2>&1 || dhcpcd -1 "$iface" >/dev/null 2>&1 || true
@@ -324,15 +501,13 @@ renew_ethernet_dhcp() {
     done
 }
 
-# Interactive Wi-Fi connector (supports nmcli, iwctl, and iw/wpa_supplicant)
 setup_wifi_connection() {
-    echo -e "${C_CYAN}[*] Searching for Wi-Fi hardware...${C_RESET}"
     local wlan_dev
-    wlan_dev=$(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(wl|wlan)' | sed -n '1p' || true)
+    wlan_dev=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(wl|wlan)' | sed -n '1p' || true)
 
     if [ -z "$wlan_dev" ]; then
-        echo -e "${C_RED}[!] No wireless network adapter detected.${C_RESET}"
-        echo -e "${C_DIM}Ensure your Ethernet cable is plugged in or use an offline USB image.${C_RESET}"
+        ui_card "196" "[ ✗ ] NO WI-FI ADAPTER FOUND" \
+            "No wireless interface (wlan/wl) detected. Plug in an Ethernet cable or use an offline USB image." "normal"
         sleep 2
         return 1
     fi
@@ -340,9 +515,7 @@ setup_wifi_connection() {
     ip link set "$wlan_dev" up 2>/dev/null || true
 
     if command -v nmcli >/dev/null 2>&1; then
-        echo -e "${C_CYAN}[*] Scanning Wi-Fi networks with NetworkManager (nmcli)...${C_RESET}"
-        nmcli dev wifi rescan 2>/dev/null || true
-        sleep 2
+        run_animated "Scanning Wi-Fi networks (nmcli)..." bash -c "nmcli dev wifi rescan >/dev/null 2>&1 || true; sleep 2"
         local ssids
         ssids=$(nmcli -t -f SSID dev wifi list 2>/dev/null | grep -v '^$' | sort -u || true)
         local ssid_arr=()
@@ -356,37 +529,37 @@ setup_wifi_connection() {
         else
             selected_ssid="Enter SSID manually"
         fi
-
         if [ "$selected_ssid" = "Enter SSID manually" ]; then
-            echo -ne "${C_CYAN}Enter Wi-Fi SSID: ${C_RESET}"
-            read -r selected_ssid
+            if [ "$TUI_BACKEND" = "gum" ]; then
+                selected_ssid=$(gum input --placeholder "Enter Wi-Fi SSID")
+            else
+                echo -ne "  ${C_CYAN}Enter Wi-Fi SSID: ${C_RESET}"
+                read -r selected_ssid
+            fi
         fi
         [ -z "$selected_ssid" ] && return 1
 
         local wifi_pass=""
         if [ "$TUI_BACKEND" = "gum" ]; then
-            wifi_pass=$(gum input --password --placeholder "Wi-Fi Password (leave empty for open network)")
+            wifi_pass=$(gum input --password --placeholder "Wi-Fi Password (blank if open)")
         else
-            echo -ne "${C_CYAN}Enter Wi-Fi Password (blank if open): ${C_RESET}"
+            echo -ne "  ${C_CYAN}Enter Wi-Fi Password (blank if open): ${C_RESET}"
             read -rs wifi_pass
             echo ""
         fi
 
-        echo -e "${C_CYAN}[*] Connecting to '${selected_ssid}'...${C_RESET}"
         if [ -n "$wifi_pass" ]; then
-            nmcli dev wifi connect "$selected_ssid" password "$wifi_pass"
+            run_animated "Connecting to ${selected_ssid}..." nmcli dev wifi connect "$selected_ssid" password "$wifi_pass"
         else
-            nmcli dev wifi connect "$selected_ssid"
+            run_animated "Connecting to ${selected_ssid}..." nmcli dev wifi connect "$selected_ssid"
         fi
     elif command -v iwctl >/dev/null 2>&1; then
-        echo -e "${C_CYAN}[*] Scanning Wi-Fi networks via iwd (iwctl)...${C_RESET}"
-        iwctl station "$wlan_dev" scan 2>/dev/null || true
-        sleep 2
+        run_animated "Scanning Wi-Fi networks (iwctl)..." bash -c "iwctl station '$wlan_dev' scan >/dev/null 2>&1 || true; sleep 2"
         iwctl station "$wlan_dev" get-networks || true
-        echo -ne "${C_CYAN}Enter Wi-Fi SSID: ${C_RESET}"
+        echo -ne "  ${C_CYAN}Enter Wi-Fi SSID: ${C_RESET}"
         read -r selected_ssid
         [ -z "$selected_ssid" ] && return 1
-        echo -ne "${C_CYAN}Enter Wi-Fi Password (blank if open): ${C_RESET}"
+        echo -ne "  ${C_CYAN}Enter Wi-Fi Password (blank if open): ${C_RESET}"
         read -rs wifi_pass
         echo ""
         if [ -n "$wifi_pass" ]; then
@@ -395,8 +568,6 @@ setup_wifi_connection() {
             iwctl station "$wlan_dev" connect "$selected_ssid"
         fi
     else
-        # Pure Alpine wpa_supplicant + iw/iwlist fallback
-        echo -e "${C_CYAN}[*] Scanning Wi-Fi networks on ${wlan_dev}...${C_RESET}"
         local ssids=""
         if command -v iw >/dev/null 2>&1; then
             ssids=$(iw dev "$wlan_dev" scan 2>/dev/null | grep -E '^\s*SSID:' | sed 's/.*SSID: //' | grep -v '^$' | sort -u || true)
@@ -415,10 +586,13 @@ setup_wifi_connection() {
         else
             selected_ssid="Enter SSID manually"
         fi
-
         if [ "$selected_ssid" = "Enter SSID manually" ]; then
-            echo -ne "${C_CYAN}Enter Wi-Fi SSID: ${C_RESET}"
-            read -r selected_ssid
+            if [ "$TUI_BACKEND" = "gum" ]; then
+                selected_ssid=$(gum input --placeholder "Enter Wi-Fi SSID")
+            else
+                echo -ne "  ${C_CYAN}Enter Wi-Fi SSID: ${C_RESET}"
+                read -r selected_ssid
+            fi
         fi
         [ -z "$selected_ssid" ] && return 1
 
@@ -426,7 +600,7 @@ setup_wifi_connection() {
         if [ "$TUI_BACKEND" = "gum" ]; then
             wifi_pass=$(gum input --password --placeholder "Enter Wi-Fi Password (blank if open)")
         else
-            echo -ne "${C_CYAN}Enter Wi-Fi Password (blank if open): ${C_RESET}"
+            echo -ne "  ${C_CYAN}Enter Wi-Fi Password (blank if open): ${C_RESET}"
             read -rs wifi_pass
             echo ""
         fi
@@ -445,38 +619,54 @@ EOF
 
         killall wpa_supplicant 2>/dev/null || true
         wpa_supplicant -B -i "$wlan_dev" -c "$wpa_conf" >/dev/null 2>&1 || true
-        sleep 3
-        if command -v dhcpcd >/dev/null 2>&1; then
-            dhcpcd -n "$wlan_dev" >/dev/null 2>&1 || dhcpcd -1 "$wlan_dev" >/dev/null 2>&1 || true
-        elif command -v udhcpc >/dev/null 2>&1; then
-            udhcpc -i "$wlan_dev" -n -q -t 5 >/dev/null 2>&1 || true
-        fi
+        run_animated "Associating Wi-Fi & acquiring DHCP lease..." bash -c "sleep 3; dhcpcd -n '$wlan_dev' >/dev/null 2>&1 || dhcpcd -1 '$wlan_dev' >/dev/null 2>&1 || true"
     fi
 }
 
 # Network verification - "Sending a carrier pigeon to 1.1.1.1 and hoping it returns"
 check_network() {
-    echo -e "${C_CYAN}[*] Checking internet connectivity...${C_RESET}"
+    DIAG_NET_ST="running"; DIAG_NET_MSG="Testing internet & syncing NTP clock..."
+    print_banner 1
+    render_diagnostics_card
+    echo ""
+
+    if run_animated "Checking internet & syncing NTP clock..." bash -c "ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1"; then
+        sync_system_clock
+        if run_animated "Verifying HTTPS connection to GitHub..." curl -Is --connect-timeout 4 https://api.github.com; then
+            local ip_now
+            ip_now=$(ip -4 addr show 2>/dev/null | awk '/inet / && $2 !~ /^127\./ {split($2,a,"/"); print a[1]; exit}' || true)
+            DIAG_NET_ST="ok"; DIAG_NET_MSG="${C_GREEN}Online (${ip_now:-DHCP} | Clock synced)${C_RESET}"
+            return 0
+        fi
+    fi
+
+    # Try wired DHCP automatically
+    DIAG_NET_MSG="Requesting wired Ethernet DHCP lease..."
+    print_banner 1
+    render_diagnostics_card
+    echo ""
+    run_animated "Requesting DHCP on Ethernet adapters..." renew_ethernet_dhcp
 
     if has_internet; then
-        echo -e "${C_GREEN}[✓] Active Internet Connection Detected!${C_RESET}"
+        local ip_now
+        ip_now=$(ip -4 addr show 2>/dev/null | awk '/inet / && $2 !~ /^127\./ {split($2,a,"/"); print a[1]; exit}' || true)
+        DIAG_NET_ST="ok"; DIAG_NET_MSG="${C_GREEN}Online via Ethernet (${ip_now:-DHCP})${C_RESET}"
         return 0
     fi
 
-    echo -e "${C_YELLOW}[!] Not online yet. Attempting Ethernet DHCP...${C_RESET}"
-    renew_ethernet_dhcp
-    sleep 1
-
-    if has_internet; then
-        echo -e "${C_GREEN}[✓] Ethernet connected and online!${C_RESET}"
-        return 0
-    fi
+    DIAG_NET_ST="warn"; DIAG_NET_MSG="${C_YELLOW}Offline — network setup or local image needed${C_RESET}"
 
     while true; do
-        print_banner
-        echo -e "${C_YELLOW}${C_BOLD}NO INTERNET CONNECTION DETECTED${C_RESET}\n"
-        echo -e "Easy-HAOS needs internet access to download the latest Home Assistant OS image,"
-        echo -e "unless you already placed a local ${C_CYAN}haos_generic-x86-64-*.img.xz${C_RESET} file on a USB drive.\n"
+        print_banner 1
+        render_diagnostics_card
+        echo ""
+
+        local net_card=""
+        net_card+="${C_YELLOW}${C_BOLD}[ ! ] No active internet connection detected.${C_RESET}\n"
+        net_card+="Connect via Ethernet/Wi-Fi to download the latest HAOS release,\n"
+        net_card+="or choose Offline Mode if you copied a ${C_CYAN}.img.xz${C_RESET} onto your USB drive."
+        ui_card "220" "Network Connection Required" "$(echo -e "$net_card")" "normal"
+        echo ""
 
         local net_action
         net_action=$(tui_choose "Select a network option:" \
@@ -488,35 +678,36 @@ check_network() {
 
         case "$net_action" in
             "Retry Ethernet / DHCP")
-                renew_ethernet_dhcp
+                run_animated "Renewing Ethernet DHCP..." renew_ethernet_dhcp
                 if has_internet; then
-                    echo -e "${C_GREEN}[✓] Connected!${C_RESET}"
-                    sleep 1
+                    local ip_now
+                    ip_now=$(ip -4 addr show 2>/dev/null | awk '/inet / && $2 !~ /^127\./ {split($2,a,"/"); print a[1]; exit}' || true)
+                    DIAG_NET_ST="ok"; DIAG_NET_MSG="${C_GREEN}Online via Ethernet (${ip_now:-DHCP})${C_RESET}"
                     return 0
                 fi
-                echo -e "${C_RED}[!] Still offline. Check Ethernet cable and link LEDs.${C_RESET}"
-                sleep 2
+                DIAG_NET_ST="fail"; DIAG_NET_MSG="${C_RED}Ethernet DHCP failed — check cable & router${C_RESET}"
                 ;;
             "Scan & Connect to Wi-Fi")
                 setup_wifi_connection || true
                 if has_internet; then
-                    echo -e "${C_GREEN}[✓] Wi-Fi connected and online!${C_RESET}"
-                    sleep 1
+                    local ip_now
+                    ip_now=$(ip -4 addr show 2>/dev/null | awk '/inet / && $2 !~ /^127\./ {split($2,a,"/"); print a[1]; exit}' || true)
+                    DIAG_NET_ST="ok"; DIAG_NET_MSG="${C_GREEN}Online via Wi-Fi (${ip_now:-DHCP})${C_RESET}"
                     return 0
                 fi
-                echo -e "${C_RED}[!] Could not reach the internet over Wi-Fi.${C_RESET}"
-                sleep 2
+                DIAG_NET_ST="fail"; DIAG_NET_MSG="${C_RED}Wi-Fi connected but internet unreachable${C_RESET}"
                 ;;
             "Open Shell to Configure Network Manually")
-                echo -e "${C_YELLOW}Dropping to bash. Run nmcli/iwctl/ip/udhcpc, then type 'exit' to return.${C_RESET}"
+                clear
+                echo -e "${C_CYAN}Configure networking (ip/iw/wpa_supplicant/dhcpcd), then type 'exit'.${C_RESET}\n"
                 /bin/bash
                 if has_internet; then
+                    DIAG_NET_ST="ok"; DIAG_NET_MSG="${C_GREEN}Online (Manual configuration)${C_RESET}"
                     return 0
                 fi
                 ;;
             "Proceed in Offline Mode"*)
-                echo -e "${C_CYAN}[*] Continuing in Offline Mode — scanning local media for HAOS image...${C_RESET}"
-                sleep 1
+                DIAG_NET_ST="warn"; DIAG_NET_MSG="${C_YELLOW}Offline Mode (Local USB image scan)${C_RESET}"
                 return 0
                 ;;
             "Reboot Machine")
@@ -531,20 +722,14 @@ check_network() {
 # STEP 2: Fetch Official HAOS Release Dynamically (with Offline Fallback)
 # ==============================================================================
 # Asking GitHub politely for the latest release before rate-limiting strikes
-fetch_haos_release() {
-    print_banner
-    echo -e "${C_CYAN}[*] Scanning USB/Ventoy partitions for offline HAOS images...${C_RESET}"
-
-    local local_candidates=()
+scan_local_images_worker() {
+    local out_file="$1"
+    : > "$out_file"
     local scan_dir="/mnt/easyhaos_scan"
     mkdir -p "$scan_dir"
 
-    # Scan existing mounted locations first
-    while IFS= read -r f; do
-        [ -f "$f" ] && local_candidates+=("$f")
-    done < <(find /mnt /media /run/media -maxdepth 3 -type f -name "haos_generic-x86-64*.img.xz" 2>/dev/null || true)
+    find /mnt /media /run/media -maxdepth 3 -type f -name "haos_generic-x86-64*.img.xz" 2>/dev/null >> "$out_file" || true
 
-    # Mount unmounted partitions read-only temporarily to check for Ventoy/USB offline images
     for blk in $(lsblk -lno PATH,TYPE 2>/dev/null | awk '$2=="part" {print $1}'); do
         local existing_mnt
         existing_mnt=$(findmnt -n -o TARGET "$blk" 2>/dev/null | sed -n '1p' || true)
@@ -552,7 +737,6 @@ fetch_haos_release() {
             if mount -o ro "$blk" "$scan_dir" 2>/dev/null; then
                 while IFS= read -r f; do
                     if [ -f "$f" ]; then
-                        # Copy path hint or keep partition mapped via persistent mountpoint
                         local safe_name
                         safe_name=$(basename "$blk")
                         local persist_mnt="/mnt/easyhaos_src_${safe_name}"
@@ -560,7 +744,7 @@ fetch_haos_release() {
                         umount "$scan_dir" 2>/dev/null || true
                         if mount -o ro "$blk" "$persist_mnt" 2>/dev/null; then
                             local matched_file="${persist_mnt}/${f#"$scan_dir"/}"
-                            [ -f "$matched_file" ] && local_candidates+=("$matched_file")
+                            [ -f "$matched_file" ] && echo "$matched_file" >> "$out_file"
                         fi
                         break
                     fi
@@ -570,17 +754,69 @@ fetch_haos_release() {
         fi
     done
     rmdir "$scan_dir" 2>/dev/null || true
+}
 
-    # Deduplicate candidate files
-    local unique_candidates=()
-    if [ ${#local_candidates[@]} -gt 0 ]; then
-        while IFS= read -r u; do
-            [ -n "$u" ] && unique_candidates+=("$u")
-        done < <(printf '%s\n' "${local_candidates[@]}" | sort -u)
+fetch_online_release_worker() {
+    local out_file="$1"
+    : > "$out_file"
+
+    local api_resp ver url size
+    api_resp=$(curl -fsSL --connect-timeout 10 "$HAOS_LATEST_API" 2>>"$ERR_LOG" || true)
+
+    if [ -n "$api_resp" ] && command -v jq >/dev/null 2>&1; then
+        ver=$(echo "$api_resp" | jq -r '[.[] | select(.prerelease == false and .draft == false and any(.assets[]; .name | test("^haos_generic-x86-64-.*\\.img\\.xz$")))] | .[0].tag_name // empty')
+        url=$(echo "$api_resp" | jq -r '[.[] | select(.prerelease == false and .draft == false) | .assets[] | select(.name | test("^haos_generic-x86-64-.*\\.img\\.xz$"))][0].browser_download_url // empty')
+        size=$(echo "$api_resp" | jq -r '[.[] | select(.prerelease == false and .draft == false) | .assets[] | select(.name | test("^haos_generic-x86-64-.*\\.img\\.xz$"))][0].size // empty')
     fi
 
+    # Fallback HTML releases scan if GitHub API rate limit was hit
+    if [ -z "$url" ]; then
+        local candidate_tags
+        candidate_tags=$(curl -fsSL --connect-timeout 10 "https://github.com/home-assistant/operating-system/releases" 2>>"$ERR_LOG" \
+            | grep -oE '/home-assistant/operating-system/releases/tag/[0-9]+\.[0-9]+(\.[0-9]+)?' \
+            | sed 's|.*/||' \
+            | awk '!seen[$0]++' || true)
+        while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            local test_url="https://github.com/home-assistant/operating-system/releases/download/${tag}/haos_generic-x86-64-${tag}.img.xz"
+            if curl -fsIL --connect-timeout 8 "$test_url" >/dev/null 2>&1; then
+                ver="$tag"
+                url="$test_url"
+                break
+            fi
+        done <<< "$candidate_tags"
+    fi
+
+    [ -n "$url" ] || return 1
+    # Verify download URL is reachable before proceeding to disk selection/wiping
+    curl -fsIL --connect-timeout 10 "$url" >/dev/null 2>>"$ERR_LOG" || return 1
+
+    printf 'HAOS_VERSION=%q\nHAOS_DOWNLOAD_URL=%q\nHAOS_ASSET_SIZE=%q\n' "$ver" "$url" "${size:-}" > "$out_file"
+}
+
+fetch_haos_release() {
+    DIAG_REL_ST="running"; DIAG_REL_MSG="Scanning USB partitions for offline images..."
+    print_banner 2
+    render_diagnostics_card
+    echo ""
+
+    local scan_out="/tmp/easyhaos_local_imgs.txt"
+    run_animated "Scanning USB/Ventoy drives for local HAOS images..." scan_local_images_worker "$scan_out"
+
+    local unique_candidates=()
+    if [ -s "$scan_out" ]; then
+        while IFS= read -r u; do
+            [ -n "$u" ] && unique_candidates+=("$u")
+        done < <(sort -u "$scan_out")
+    fi
+    rm -f "$scan_out"
+
     if [ ${#unique_candidates[@]} -gt 0 ]; then
-        echo -e "${C_GREEN}[✓] Found ${#unique_candidates[@]} local HAOS image(s) on USB/storage!${C_RESET}"
+        DIAG_REL_ST="ok"; DIAG_REL_MSG="${C_GREEN}Found ${#unique_candidates[@]} local offline image(s)${C_RESET}"
+        print_banner 2
+        render_diagnostics_card
+        echo ""
+
         local chosen_file
         chosen_file=$(tui_choose "Use a local offline HAOS image or download latest from GitHub?" \
             "${unique_candidates[@]}" \
@@ -590,41 +826,42 @@ fetch_haos_release() {
             HAOS_IMAGE_FILE="$chosen_file"
             IS_OFFLINE_IMAGE=true
             HAOS_VERSION=$(basename "$chosen_file" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | sed -n '1p' || echo "Offline")
-            echo -e "${C_GREEN}[✓] Selected local image: ${HAOS_IMAGE_FILE} (v${HAOS_VERSION})${C_RESET}"
-            sleep 1
+            local mb_sz
+            mb_sz=$(( $(stat -c%s "$chosen_file" 2>/dev/null || echo 0) / 1048576 ))
+            DIAG_REL_ST="ok"; DIAG_REL_MSG="${C_GREEN}Offline v${HAOS_VERSION} (${mb_sz} MB) ready${C_RESET}"
             return 0
         fi
     fi
 
-    # Query official GitHub Releases API
-    echo -e "${C_CYAN}[*] Querying GitHub API for latest Home Assistant OS x86-64 release...${C_RESET}"
-    local api_resp
-    api_resp=$(curl -fsSL --connect-timeout 10 "$HAOS_LATEST_API" 2>/dev/null || true)
+    # Fetch online release with animated spinner & verify HTTP availability
+    DIAG_REL_ST="running"; DIAG_REL_MSG="Querying GitHub API for newest x86-64 build..."
+    print_banner 2
+    render_diagnostics_card
+    echo ""
 
-    if [ -n "$api_resp" ] && command -v jq >/dev/null 2>&1; then
-        HAOS_VERSION=$(echo "$api_resp" | jq -r '.tag_name // empty')
-        HAOS_DOWNLOAD_URL=$(echo "$api_resp" | jq -r '[.assets[] | select(.name | test("^haos_generic-x86-64-.*\\.img\\.xz$")) | .browser_download_url][0] // empty')
-        HAOS_ASSET_SIZE=$(echo "$api_resp" | jq -r '[.assets[] | select(.name | test("^haos_generic-x86-64-.*\\.img\\.xz$")) | .size][0] // empty')
+    local rel_out="/tmp/easyhaos_rel_vars.sh"
+    : > "$ERR_LOG"
+    if ! run_animated "Resolving & verifying latest Home Assistant OS x86-64 release..." fetch_online_release_worker "$rel_out"; then
+        rm -f "$rel_out"
+        DIAG_REL_ST="fail"; DIAG_REL_MSG="${C_RED}Failed to resolve/verify HAOS x86-64 release${C_RESET}"
+        fatal_error "HAOS Release Lookup Failed" \
+            "Could not find or verify a reachable Home Assistant OS Generic x86-64 download URL." \
+            "Check your Ethernet cable or Wi-Fi connection." \
+            "If GitHub is unreachable, copy haos_generic-x86-64-*.img.xz onto a Ventoy/USB stick."
+        return 1
     fi
 
-    # Fallback redirect resolution if GitHub API rate limit was hit
-    if [ -z "$HAOS_DOWNLOAD_URL" ]; then
-        echo -e "${C_YELLOW}[!] GitHub API unavailable or rate-limited; falling back to redirect lookup...${C_RESET}"
-        local redirect_url
-        redirect_url=$(curl -Ls -o /dev/null -w '%{url_effective}' "https://github.com/home-assistant/operating-system/releases/latest" 2>/dev/null || true)
-        HAOS_VERSION=$(basename "$redirect_url")
-        if [ -n "$HAOS_VERSION" ] && [ "$HAOS_VERSION" != "latest" ]; then
-            HAOS_DOWNLOAD_URL="https://github.com/home-assistant/operating-system/releases/download/${HAOS_VERSION}/haos_generic-x86-64-${HAOS_VERSION}.img.xz"
-        fi
-    fi
+    # shellcheck source=/dev/null
+    source "$rel_out"
+    rm -f "$rel_out"
 
-    if [ -z "$HAOS_DOWNLOAD_URL" ]; then
-        fatal_error "Failed to fetch Home Assistant OS release URL. Ensure you are online or place a .img.xz on your USB."
+    local size_label=""
+    if [ -n "$HAOS_ASSET_SIZE" ] && [ "$HAOS_ASSET_SIZE" -gt 0 ] 2>/dev/null; then
+        size_label=" ($(( HAOS_ASSET_SIZE / 1048576 )) MB verified)"
+    else
+        size_label=" (URL verified)"
     fi
-
-    echo -e "${C_GREEN}[✓] Latest Home Assistant OS Version : ${C_WHITE}${C_BOLD}${HAOS_VERSION}${C_RESET}"
-    echo -e "${C_DIM}    Download URL: ${HAOS_DOWNLOAD_URL}${C_RESET}"
-    sleep 1
+    DIAG_REL_ST="ok"; DIAG_REL_MSG="${C_GREEN}Official v${HAOS_VERSION}${size_label}${C_RESET}"
 }
 
 # ==============================================================================
@@ -648,59 +885,65 @@ add_protected_disk() {
     PROTECTED_DISKS+=("$parent")
 }
 
-detect_boot_device() {
-    PROTECTED_DISKS=()
+detect_boot_device_worker() {
+    local out_file="$1"
+    : > "$out_file"
+    local found=()
 
-    # 1. Check root and common live mount points
     for mnt in / /live /run/archiso/bootmnt /mnt/boot /media/usb; do
         local src
         src=$(findmnt -n -o SOURCE "$mnt" 2>/dev/null || true)
-        if [ -n "$src" ] && [[ "$src" == /dev/* ]]; then
-            add_protected_disk "$src"
-        fi
+        [ -n "$src" ] && [[ "$src" == /dev/* ]] && found+=("$src")
     done
 
-    # 2. Check partitions matching Easy-HAOS or Ventoy labels
     for label in EASY_HAOS Ventoy VTOYEFI; do
         local ldev
         ldev=$(blkid -L "$label" 2>/dev/null || true)
-        if [ -n "$ldev" ]; then
-            add_protected_disk "$ldev"
-        fi
+        [ -n "$ldev" ] && found+=("$ldev")
     done
 
-    # 3. Scan partitions for /.easy-haos-usb marker file (handles Rufus FAT32 re-labels)
     local probe_dir="/mnt/easyhaos_probe"
     mkdir -p "$probe_dir"
     for blk in $(lsblk -lno PATH,TYPE 2>/dev/null | awk '$2=="part" {print $1}'); do
         local mnt_pt
         mnt_pt=$(findmnt -n -o TARGET "$blk" 2>/dev/null | sed -n '1p' || true)
         if [ -n "$mnt_pt" ]; then
-            if [ -f "${mnt_pt}/.easy-haos-usb" ]; then
-                add_protected_disk "$blk"
-            fi
+            [ -f "${mnt_pt}/.easy-haos-usb" ] && found+=("$blk")
         else
             if mount -o ro "$blk" "$probe_dir" 2>/dev/null; then
-                if [ -f "${probe_dir}/.easy-haos-usb" ]; then
-                    add_protected_disk "$blk"
-                fi
+                [ -f "${probe_dir}/.easy-haos-usb" ] && found+=("$blk")
                 umount "$probe_dir" 2>/dev/null || true
             fi
         fi
     done
     rmdir "$probe_dir" 2>/dev/null || true
 
-    # 4. Also protect any disk hosting our selected offline .img.xz file!
     if [ "$IS_OFFLINE_IMAGE" = true ] && [ -n "$HAOS_IMAGE_FILE" ]; then
         local img_src
         img_src=$(findmnt -n -o SOURCE --target "$HAOS_IMAGE_FILE" 2>/dev/null || true)
-        if [ -n "$img_src" ] && [[ "$img_src" == /dev/* ]]; then
-            add_protected_disk "$img_src"
-        fi
+        [ -n "$img_src" ] && [[ "$img_src" == /dev/* ]] && found+=("$img_src")
     fi
 
+    for item in "${found[@]:-}"; do
+        [ -n "$item" ] && echo "$item" >> "$out_file"
+    done
+}
+
+detect_boot_device() {
+    PROTECTED_DISKS=()
+    local usb_out="/tmp/easyhaos_protected.txt"
+    run_animated "Identifying & locking installer USB media..." detect_boot_device_worker "$usb_out"
+    if [ -s "$usb_out" ]; then
+        while IFS= read -r dev_path; do
+            [ -n "$dev_path" ] && add_protected_disk "$dev_path"
+        done < "$usb_out"
+    fi
+    rm -f "$usb_out"
+
     if [ ${#PROTECTED_DISKS[@]} -gt 0 ]; then
-        echo -e "${C_YELLOW}[!] Protected Boot/Installer Media Excluded: ${PROTECTED_DISKS[*]/#/\/dev\/}${C_RESET}"
+        DIAG_USB_ST="ok"; DIAG_USB_MSG="${C_GREEN}Protected: ${PROTECTED_DISKS[*]/#/\/dev\/} (excluded)${C_RESET}"
+    else
+        DIAG_USB_ST="warn"; DIAG_USB_MSG="${C_YELLOW}Running from RAM (double-check drive model below)${C_RESET}"
     fi
 }
 
@@ -713,12 +956,18 @@ is_protected_disk() {
 }
 
 select_target_disk() {
-    while true; do
-        print_banner
-        detect_boot_device
-        echo -e "\n${C_CYAN}[*] Scanning internal block devices (NVMe, SATA SSD, eMMC)...${C_RESET}\n"
+    DIAG_USB_ST="running"; DIAG_USB_MSG="Scanning block devices & USB markers..."
+    print_banner 3
+    render_diagnostics_card
+    echo ""
 
-        # List raw disks excluding loop(7), ram(1), optical/sr(11)
+    detect_boot_device
+
+    while true; do
+        print_banner 3
+        render_diagnostics_card
+        echo ""
+
         local raw_disks
         raw_disks=$(lsblk -d -n -o NAME,SIZE,MODEL,TRAN,TYPE -e 7,1,11 2>/dev/null || true)
 
@@ -732,14 +981,9 @@ select_target_disk() {
             d_size=$(echo "$line" | awk '{print $2}')
             d_type=$(echo "$line" | awk '{print $NF}')
 
-            # Only allow real disks
             [ "$d_type" != "disk" ] && continue
             [[ "$d_name" =~ ^(zram|ram|loop|sr|fd) ]] && continue
-
-            # Never allow overwriting the installer USB or offline image source disk
-            if is_protected_disk "$d_name"; then
-                continue
-            fi
+            is_protected_disk "$d_name" && continue
 
             d_tran=$(lsblk -d -n -o TRAN "/dev/${d_name}" 2>/dev/null | tr -d '[:space:]' || echo "disk")
             [ -z "$d_tran" ] && d_tran="internal"
@@ -747,22 +991,23 @@ select_target_disk() {
             [ -z "$d_model" ] && d_model="Generic Storage Device"
 
             disk_list+=("$d_name")
-            disk_display+=("/dev/${d_name}  |  ${d_size}  |  [${d_tran}] ${d_model}")
+            disk_display+=("$(printf '/dev/%-8s | %7s | [%-4s] %s' "$d_name" "$d_size" "$d_tran" "$d_model")")
         done <<< "$raw_disks"
 
         if [ ${#disk_list[@]} -eq 0 ]; then
-            clear
-            echo -e "${C_BG_RED}${C_WHITE}${C_BOLD} NO SUITABLE TARGET DISKS FOUND ${C_RESET}\n"
-            echo -e "${C_RED}No internal NVMe, SATA SSD, or eMMC drives were detected!${C_RESET}\n"
-            echo -e "${C_YELLOW}Troubleshooting tips for Mini PCs (N100 / NUC / OptiPlex):${C_RESET}"
-            echo -e "  1. Check BIOS storage mode: switch from ${C_RED}RAID / Intel RST${C_RESET} to ${C_GREEN}AHCI / NVMe${C_RESET}."
-            echo -e "  2. Verify the SSD/NVMe drive is seated firmly."
-            echo -e "  3. Remember that the Easy-HAOS installer USB is automatically hidden for safety.\n"
-            fatal_error "No valid install target disk detected."
+            fatal_error "No Target Storage Drives Found" \
+                "No internal NVMe, SATA SSD, or eMMC drives were detected." \
+                "Enter BIOS and switch SATA/Storage Controller mode from RAID/Intel RST to AHCI." \
+                "Verify the NVMe/SATA SSD is firmly seated." \
+                "Note: your Easy-HAOS installer USB is intentionally hidden for safety."
+            return 1
         fi
 
         local selected_label
-        selected_label=$(tui_choose "Select target disk to ERASE and install Home Assistant OS ${HAOS_VERSION}:" "${disk_display[@]}") || fatal_error "Disk selection cancelled."
+        selected_label=$(tui_choose "Select target disk to ERASE and install Home Assistant OS v${HAOS_VERSION}:" "${disk_display[@]}") || {
+            fatal_error "Disk Selection Cancelled" "No target disk was selected." "Select an internal drive to continue."
+            return 1
+        }
 
         TARGET_DISK=""
         for i in "${!disk_display[@]}"; do
@@ -773,30 +1018,35 @@ select_target_disk() {
         done
 
         if [ -z "$TARGET_DISK" ] || [ ! -b "/dev/${TARGET_DISK}" ]; then
-            fatal_error "Invalid block device selected."
+            fatal_error "Invalid Block Device" "The chosen device /dev/${TARGET_DISK} is not a valid block device."
+            return 1
         fi
 
         TARGET_SIZE=$(lsblk -d -n -o SIZE "/dev/${TARGET_DISK}" 2>/dev/null | tr -d '[:space:]')
         TARGET_MODEL=$(lsblk -d -n -o MODEL "/dev/${TARGET_DISK}" 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//')
         [ -z "$TARGET_MODEL" ] && TARGET_MODEL="Unknown Model"
 
-        # Explicit Confirmation Step
+        # Explicit Confirmation Card
         # Wiping partition tables - "Say goodbye to Windows 11 bloatware. No regrets."
-        print_banner
-        echo -e "\n${C_BG_RED}${C_WHITE}${C_BOLD} !!! FINAL WARNING: IRREVERSIBLE DISK WIPE !!! ${C_RESET}\n"
-        echo -e "  Target Device : ${C_WHITE}${C_BOLD}/dev/${TARGET_DISK}${C_RESET}"
-        echo -e "  Disk Model    : ${C_WHITE}${C_BOLD}${TARGET_MODEL}${C_RESET}"
-        echo -e "  Capacity      : ${C_WHITE}${C_BOLD}${TARGET_SIZE}${C_RESET}"
-        echo -e "  Installing    : ${C_GREEN}${C_BOLD}Home Assistant OS v${HAOS_VERSION}${C_RESET}\n"
-        echo -e "${C_RED}${C_BOLD}ALL DATA ON /dev/${TARGET_DISK} (${TARGET_MODEL}) WILL BE PERMANENTLY ERASED!${C_RESET}\n"
+        print_banner 3
+
+        local warn_body=""
+        warn_body+="${C_RED}${C_BOLD}ALL DATA ON THIS DRIVE WILL BE PERMANENTLY ERASED!${C_RESET}\n\n"
+        warn_body+="  Target Device : ${C_WHITE}${C_BOLD}/dev/${TARGET_DISK}${C_RESET}\n"
+        warn_body+="  Disk Model    : ${C_WHITE}${C_BOLD}${TARGET_MODEL}${C_RESET}\n"
+        warn_body+="  Capacity      : ${C_WHITE}${C_BOLD}${TARGET_SIZE}${C_RESET}\n"
+        warn_body+="  Installing    : ${C_GREEN}${C_BOLD}Home Assistant OS v${HAOS_VERSION}${C_RESET}"
+
+        ui_card "196" "[ ! ] FINAL DESTRUCTIVE CONFIRMATION" "$(echo -e "$warn_body")" "double"
+        echo ""
 
         local confirm_prompt="Type YES to erase ${TARGET_MODEL} and install Home Assistant OS v${HAOS_VERSION}"
         local confirm_text=""
         if [ "$TUI_BACKEND" = "gum" ]; then
-            echo -e "${C_WHITE}${confirm_prompt}:${C_RESET}"
-            confirm_text=$(gum input --placeholder "Type YES in uppercase")
+            echo -e "  ${C_WHITE}${confirm_prompt}:${C_RESET}"
+            confirm_text=$(gum input --width 40 --placeholder "Type YES in uppercase")
         else
-            echo -ne "${C_WHITE}${confirm_prompt}: ${C_RESET}"
+            echo -ne "  ${C_WHITE}${confirm_prompt}: ${C_RESET}"
             read -r confirm_text
         fi
 
@@ -804,7 +1054,7 @@ select_target_disk() {
             break
         fi
 
-        echo -e "\n${C_YELLOW}[*] Confirmation did not match 'YES'. No changes were made.${C_RESET}"
+        echo -e "\n  ${C_YELLOW}[ ! ] Confirmation did not match 'YES'. Returning to disk list...${C_RESET}"
         sleep 1
     done
 }
@@ -813,24 +1063,60 @@ select_target_disk() {
 # STEP 4: Streaming Flash & Post-Install Verification
 # ==============================================================================
 # Streaming HAOS - "Zero to Home Assistant in 60 seconds, straight into silicon"
-flash_target_disk() {
-    print_banner
-    local dev="/dev/${TARGET_DISK}"
-
-    echo -e "${C_CYAN}[1/4] Unmounting any existing partitions on ${dev}...${C_RESET}"
-    for part in $(lsblk -lno PATH "${dev}" 2>/dev/null | grep -v "^${dev}$" || true); do
+unmount_target_worker() {
+    local dev="$1"
+    for part in $(lsblk -lno PATH "$dev" 2>/dev/null | grep -v "^${dev}$" || true); do
         umount -f "$part" 2>/dev/null || true
         swapoff "$part" 2>/dev/null || true
     done
+}
 
-    echo -e "${C_CYAN}[2/4] Wiping partition signatures on ${dev}...${C_RESET}"
+wipe_target_worker() {
+    local dev="$1"
+    wipefs -a -f "$dev" >/dev/null 2>>"$ERR_LOG" || true
+    blkdiscard "$dev" >/dev/null 2>&1 || true
+    dd if=/dev/zero of="$dev" bs=1M count=8 conv=fsync status=none 2>>"$ERR_LOG"
+}
+
+flash_target_disk() {
+    local dev="/dev/${TARGET_DISK}"
+    : > "$ERR_LOG"
+
+    # Stage 1: Unmount
+    FLASH_S1_ST="running"; FLASH_S1_MSG="Unmounting any active partitions on ${dev}..."
+    FLASH_S2_ST="pending"; FLASH_S2_MSG="Wipe partition signatures & GPT table"
+    FLASH_S3_ST="pending"; FLASH_S3_MSG="Stream & flash Home Assistant OS v${HAOS_VERSION}"
+    FLASH_S4_ST="pending"; FLASH_S4_MSG="Verify GPT partitions & register UEFI BootOrder"
+
+    print_banner 4
+    render_flash_card
+    echo ""
+
+    run_animated "Unmounting partitions on ${dev}..." unmount_target_worker "$dev"
+    FLASH_S1_ST="ok"; FLASH_S1_MSG="${C_GREEN}Unmounted existing partitions on ${dev}${C_RESET}"
+
+    # Stage 2: Wipe
     # Wiping partition tables - "Say goodbye to Windows 11 bloatware. No regrets."
-    wipefs -a -f "${dev}" >/dev/null 2>&1 || true
-    blkdiscard "${dev}" >/dev/null 2>&1 || true
-    dd if=/dev/zero of="${dev}" bs=1M count=8 conv=fsync status=none 2>/dev/null || true
+    FLASH_S2_ST="running"; FLASH_S2_MSG="Wiping partition tables & GPT signatures..."
+    print_banner 4
+    render_flash_card
+    echo ""
 
-    echo -e "${C_CYAN}[3/4] Streaming and flashing Home Assistant OS v${HAOS_VERSION} to ${dev}...${C_RESET}"
-    echo -e "${C_DIM}      (Please do not unplug power or the USB drive while writing)${C_RESET}\n"
+    if ! run_animated "Wiping existing partition tables..." wipe_target_worker "$dev"; then
+        FLASH_S2_ST="fail"; FLASH_S2_MSG="${C_RED}Failed to wipe ${dev}${C_RESET}"
+        fatal_error "Disk Wipe Failed" \
+            "Could not erase partition signatures on ${dev}." \
+            "Check that the drive is healthy and not write-protected."
+        return 1
+    fi
+    FLASH_S2_ST="ok"; FLASH_S2_MSG="${C_GREEN}Partition signatures & GPT wiped clean${C_RESET}"
+
+    # Stage 3: Streaming Flash
+    FLASH_S3_ST="running"; FLASH_S3_MSG="Streaming & writing Home Assistant OS v${HAOS_VERSION}..."
+    print_banner 4
+    render_flash_card
+    echo ""
+    echo -e "  ${C_DIM}Do not unplug power or remove the USB stick while flashing...${C_RESET}\n"
 
     local start_time
     start_time=$(date +%s)
@@ -840,11 +1126,11 @@ flash_target_disk() {
         local file_bytes
         file_bytes=$(stat -c%s "$HAOS_IMAGE_FILE" 2>/dev/null || echo 0)
         if command -v pv >/dev/null 2>&1 && [ "$file_bytes" -gt 0 ]; then
-            pv -s "$file_bytes" -N "Flashing Local HAOS" "$HAOS_IMAGE_FILE" | xz -d | dd of="${dev}" bs=4M conv=fsync status=none
+            pv -s "$file_bytes" -N "  Flashing" "$HAOS_IMAGE_FILE" | xz -d 2>>"$ERR_LOG" | dd of="${dev}" bs=4M conv=fsync status=none 2>>"$ERR_LOG"
         elif command -v pv >/dev/null 2>&1; then
-            pv -N "Flashing Local HAOS" "$HAOS_IMAGE_FILE" | xz -d | dd of="${dev}" bs=4M conv=fsync status=none
+            pv -N "  Flashing" "$HAOS_IMAGE_FILE" | xz -d 2>>"$ERR_LOG" | dd of="${dev}" bs=4M conv=fsync status=none 2>>"$ERR_LOG"
         else
-            xz -dc "$HAOS_IMAGE_FILE" | dd of="${dev}" bs=4M conv=fsync status=progress
+            xz -dc "$HAOS_IMAGE_FILE" 2>>"$ERR_LOG" | dd of="${dev}" bs=4M conv=fsync status=progress
         fi
         for rc in "${PIPESTATUS[@]}"; do
             [ "$rc" -ne 0 ] && pipe_failed=true
@@ -852,12 +1138,20 @@ flash_target_disk() {
     else
         if command -v pv >/dev/null 2>&1; then
             if [ -n "$HAOS_ASSET_SIZE" ] && [ "$HAOS_ASSET_SIZE" -gt 0 ] 2>/dev/null; then
-                curl -f -L --retry 3 --retry-delay 2 -s "$HAOS_DOWNLOAD_URL" | pv -s "$HAOS_ASSET_SIZE" -N "Downloading & Flashing" | xz -d | dd of="${dev}" bs=4M conv=fsync status=none
+                curl -f -L --retry 3 --retry-delay 2 -sS "$HAOS_DOWNLOAD_URL" 2>>"$ERR_LOG" \
+                    | pv -s "$HAOS_ASSET_SIZE" -N "  Flashing" \
+                    | xz -d 2>>"$ERR_LOG" \
+                    | dd of="${dev}" bs=4M conv=fsync status=none 2>>"$ERR_LOG"
             else
-                curl -f -L --retry 3 --retry-delay 2 -s "$HAOS_DOWNLOAD_URL" | pv -N "Downloading & Flashing" | xz -d | dd of="${dev}" bs=4M conv=fsync status=none
+                curl -f -L --retry 3 --retry-delay 2 -sS "$HAOS_DOWNLOAD_URL" 2>>"$ERR_LOG" \
+                    | pv -N "  Flashing" \
+                    | xz -d 2>>"$ERR_LOG" \
+                    | dd of="${dev}" bs=4M conv=fsync status=none 2>>"$ERR_LOG"
             fi
         else
-            curl -f -L --retry 3 --retry-delay 2 "$HAOS_DOWNLOAD_URL" | xz -d | dd of="${dev}" bs=4M conv=fsync status=progress
+            curl -f -L --retry 3 --retry-delay 2 "$HAOS_DOWNLOAD_URL" 2>>"$ERR_LOG" \
+                | xz -d 2>>"$ERR_LOG" \
+                | dd of="${dev}" bs=4M conv=fsync status=progress
         fi
         for rc in "${PIPESTATUS[@]}"; do
             [ "$rc" -ne 0 ] && pipe_failed=true
@@ -865,43 +1159,39 @@ flash_target_disk() {
     fi
 
     if [ "$pipe_failed" = true ]; then
-        fatal_error "Streaming flash pipeline failed! Check network stability or disk health and retry."
+        FLASH_S3_ST="fail"; FLASH_S3_MSG="${C_RED}Streaming flash failed!${C_RESET}"
+        fatal_error "Flash Pipeline Failed" \
+            "Streaming Home Assistant OS v${HAOS_VERSION} onto ${dev} was interrupted." \
+            "Check your internet stability or try a different Ethernet cable/Wi-Fi network." \
+            "Verify the target SSD/NVMe drive has at least 32 GB capacity and no hardware errors."
+        return 1
     fi
 
-    echo -e "\n${C_CYAN}[*] Flushing write buffers to physical storage...${C_RESET}"
-    sync
-    sleep 2
-
+    run_animated "Flushing hardware write buffers (sync)..." bash -c "sync; sleep 1"
     local end_time
     end_time=$(date +%s)
-    local elapsed=$((end_time - start_time))
-    echo -e "${C_GREEN}[✓] Flash completed cleanly in ${elapsed} seconds!${C_RESET}\n"
+    local elapsed=$(( end_time - start_time ))
+    FLASH_S3_ST="ok"; FLASH_S3_MSG="${C_GREEN}Flashed HAOS v${HAOS_VERSION} in ${elapsed}s${C_RESET}"
 
-    # Post-Install Verification
-    echo -e "${C_CYAN}[4/4] Running partprobe & verifying UEFI Boot Manager...${C_RESET}"
+    # Stage 4: Verification & UEFI BootOrder
     # Poking UEFI firmware with a stick until it cooperates
-    partprobe "${dev}" 2>/dev/null || blockdev --rereadpt "${dev}" 2>/dev/null || true
-    udevadm settle 2>/dev/null || sleep 2
+    FLASH_S4_ST="running"; FLASH_S4_MSG="Verifying GPT partitions & UEFI NVRAM..."
+    print_banner 4
+    render_flash_card
+    echo ""
+
+    run_animated "Re-reading partition table & settling udev..." bash -c "partprobe '${dev}' 2>/dev/null || blockdev --rereadpt '${dev}' 2>/dev/null || true; udevadm settle 2>/dev/null || sleep 2"
 
     local efi_part="${dev}1"
     if [[ "$dev" =~ (nvme|mmcblk) ]]; then
         efi_part="${dev}p1"
     fi
 
-    if [ -b "$efi_part" ]; then
-        echo -e "${C_GREEN}[✓] Verified Home Assistant OS EFI partition at ${efi_part}.${C_RESET}"
-    else
-        echo -e "${C_YELLOW}[!] Partition ${efi_part} not immediately enumerated; kernel will rescan on reboot.${C_RESET}"
-    fi
-
     if command -v efibootmgr >/dev/null 2>&1 && [ -d /sys/firmware/efi ]; then
-        echo -e "${C_CYAN}[*] Registering Home Assistant OS at top of UEFI BootOrder...${C_RESET}"
-        # Remove stale duplicate entries
         while IFS= read -r bootnum; do
             [ -n "$bootnum" ] && efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
         done < <(efibootmgr 2>/dev/null | grep -i "Home Assistant OS" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')
 
-        # Create fresh entry (efibootmgr -c places the new entry at the top of BootOrder by default)
         if efibootmgr -c -d "${dev}" -p 1 -L "Home Assistant OS" -l '\EFI\BOOT\bootx64.efi' >/dev/null 2>&1; then
             local new_bootnum
             new_bootnum=$(efibootmgr 2>/dev/null | grep -i "Home Assistant OS" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' | sed -n '1p')
@@ -918,17 +1208,20 @@ flash_target_disk() {
                     fi
                 fi
             fi
-            echo -e "${C_GREEN}[✓] UEFI BootOrder updated: Home Assistant OS is Boot #1.${C_RESET}"
-            efibootmgr 2>/dev/null | grep -E '^(BootOrder|BootCurrent|.*Home Assistant)' || true
+            FLASH_S4_ST="ok"; FLASH_S4_MSG="${C_GREEN}Verified ${efi_part} & registered UEFI Boot #1${C_RESET}"
         else
-            echo -e "${C_YELLOW}[!] Could not write UEFI NVRAM entry (some Mini PCs use fallback \\EFI\\BOOT\\bootx64.efi automatically).${C_RESET}"
+            FLASH_S4_ST="warn"; FLASH_S4_MSG="${C_YELLOW}Partition verified (using fallback \\EFI\\BOOT\\bootx64.efi)${C_RESET}"
         fi
+    else
+        FLASH_S4_ST="ok"; FLASH_S4_MSG="${C_GREEN}Verified partition table on ${dev}${C_RESET}"
     fi
 
-    # Unmount any read-only scan mounts cleanly
     for mnt in /mnt/easyhaos_src_*; do
         [ -d "$mnt" ] && umount "$mnt" 2>/dev/null || true
     done
+
+    print_banner 4
+    render_flash_card
     sleep 1
 }
 
@@ -937,71 +1230,87 @@ flash_target_disk() {
 # ==============================================================================
 # Completion - "It worked on my machine, so it should work on yours!"
 show_completion_screen() {
-    clear
-    cat << "EOF"
-  ___ _   _ ____ _____  _    _     _        _  _____ ___ ___  _   _ 
- |_ _| \ | / ___|_   _|/ \  | |   | |      / \|_   _|_ _/ _ \| \ | |
-  | ||  \| \___ \ | | / _ \ | |   | |     / _ \ | |  | | | | |  \| |
-  | || |\  |___) || |/ ___ \| |___| |___ / ___ \| |  | | |_| | |\  |
- |___|_| \_|____/ |_/_/   \_\_____|_____/_/   \_\_| |___\___/|_| \_|
-                                                                    
-  ____ ___  __  __ ____  _     _____ _____ _____ ____  _ 
- / ___/ _ \|  \/  |  _ \| |   | ____|_   _| ____|  _ \| |
-| |  | | | | |\/| | |_) | |   |  _|   | | |  _| | | | | |
-| |__| |_| | |  | |  __/| |___| |___  | | | |___| |_| |_|
- \____\___/|_|  |_|_|   |_____|_____| |_| |_____|____/(_)
-EOF
-
-    echo -e "\n${C_GREEN}${C_BOLD}======================================================================${C_RESET}"
-    echo -e "${C_GREEN}${C_BOLD}   Home Assistant OS v${HAOS_VERSION} Installed on /dev/${TARGET_DISK}!${C_RESET}"
-    echo -e "${C_GREEN}${C_BOLD}======================================================================${C_RESET}\n"
+    print_banner 5
 
     local ips
     ips=$(ip -4 addr show 2>/dev/null | awk '/inet / && $2 !~ /^127\./ {split($2,a,"/"); print a[1]}' || true)
 
-    echo -e "${C_WHITE}${C_BOLD}NEXT STEPS:${C_RESET}"
-    echo -e "  1. ${C_YELLOW}${C_BOLD}REMOVE THE USB INSTALLER STICK${C_RESET} from this computer right now."
-    echo -e "  2. Press ${C_CYAN}[ENTER]${C_RESET} below to reboot into Home Assistant OS."
-    echo -e "  3. Wait ~2-5 minutes on first boot while HAOS initializes."
-    echo -e "  4. Open your browser from any device on your network and visit:"
-    echo -e "     ${C_GREEN}${C_BOLD}http://homeassistant.local:8123${C_RESET}"
+    local done_body=""
+    done_body+="${C_GREEN}${C_BOLD}[ ✓ ] Home Assistant OS v${HAOS_VERSION} is installed on /dev/${TARGET_DISK}!${C_RESET}\n\n"
+    done_body+="${C_WHITE}${C_BOLD}Next Steps:${C_RESET}\n"
+    done_body+="  1. ${C_YELLOW}${C_BOLD}UNPLUG THE EASY-HAOS USB STICK${C_RESET} from this PC now.\n"
+    done_body+="  2. Select ${C_CYAN}Reboot Now${C_RESET} below to boot into Home Assistant OS.\n"
+    done_body+="  3. Wait 2-5 minutes on first boot while HAOS initializes.\n"
+    done_body+="  4. Open a browser on your phone or PC and visit:\n"
+    done_body+="     ${C_GREEN}${C_BOLD}http://homeassistant.local:8123${C_RESET}\n"
 
     if [ -n "$ips" ]; then
-        echo -e "\n${C_WHITE}Detected Local IPv4 Address(es) (if DHCP assigns the same lease):${C_RESET}"
+        done_body+="\n${C_WHITE}Detected LAN IP(s):${C_RESET}\n"
         while IFS= read -r ip; do
-            [ -n "$ip" ] && echo -e "     ${C_CYAN}${C_BOLD}http://${ip}:8123${C_RESET}"
+            [ -n "$ip" ] && done_body+="     ${C_CYAN}${C_BOLD}http://${ip}:8123${C_RESET}\n"
         done <<< "$ips"
     fi
 
-    echo -e "\n${C_BLUE}──────────────────────────────────────────────────────────────────────${C_RESET}"
-    echo -e "${C_WHITE}${C_BOLD}  Easy-HAOS by Christian Bennetsen${C_RESET}"
-    echo -e "   • Website : ${C_CYAN}https://bennetsen.dk${C_RESET}"
-    echo -e "   • Email   : ${C_CYAN}christian@bennetsen.dk${C_RESET}"
-    echo -e "   • LinkedIn: ${C_CYAN}https://www.linkedin.com/in/mrbennetsen/${C_RESET}"
-    echo -e "   • YouTube : ${C_CYAN}https://www.youtube.com/@BennetsenTech${C_RESET}"
-    echo -e "${C_BLUE}──────────────────────────────────────────────────────────────────────${C_RESET}\n"
+    done_body+="\n${C_DIM}──────────────────────────────────────────────────────────────────${C_RESET}\n"
+    done_body+="${C_WHITE}Christian Bennetsen${C_RESET}  |  ${C_CYAN}https://bennetsen.dk${C_RESET}  |  ${C_CYAN}christian@bennetsen.dk${C_RESET}\n"
+    done_body+="${C_DIM}YouTube: https://www.youtube.com/@BennetsenTech${C_RESET}\n"
+    done_body+="${C_DIM}LinkedIn: https://www.linkedin.com/in/mrbennetsen/${C_RESET}"
 
-    echo -ne "${C_YELLOW}${C_BOLD}Unplug the USB stick, then press [ENTER] to reboot... ${C_RESET}"
-    read -r
-    echo -e "${C_GREEN}[*] Rebooting into Home Assistant OS... Enjoy your smart home!${C_RESET}"
-    sync
-    reboot -f
+    ui_card "46" "[ ✓ ] INSTALLATION COMPLETE" "$(echo -e "$done_body")" "double"
+    echo ""
+
+    while true; do
+        local end_choice
+        end_choice=$(tui_choose "USB removed? Choose next action:" \
+            "Reboot Now into Home Assistant OS" \
+            "Power Off Machine" \
+            "Open Diagnostic Shell (bash)") || continue
+
+        case "$end_choice" in
+            "Reboot Now into Home Assistant OS")
+                sync
+                reboot -f
+                ;;
+            "Power Off Machine")
+                sync
+                poweroff -f
+                ;;
+            "Open Diagnostic Shell (bash)")
+                clear
+                /bin/bash
+                ;;
+        esac
+    done
 }
 
 # ==============================================================================
 # MAIN EXECUTION FLOW
 # ==============================================================================
 main() {
-    print_banner
-    echo -e "${C_CYAN}[*] Starting Easy-HAOS Pre-Flight Checks...${C_RESET}\n"
+    while true; do
+        reset_wizard_state
 
-    check_uefi_mode
-    check_secure_boot
-    check_network
-    fetch_haos_release
-    select_target_disk
-    flash_target_disk
-    show_completion_screen
+        check_uefi_mode
+        [ "$RETRY_REQUESTED" = true ] && continue
+
+        check_secure_boot || true
+        [ "$RETRY_REQUESTED" = true ] && continue
+
+        check_network || true
+        [ "$RETRY_REQUESTED" = true ] && continue
+
+        fetch_haos_release || true
+        [ "$RETRY_REQUESTED" = true ] && continue
+
+        select_target_disk || true
+        [ "$RETRY_REQUESTED" = true ] && continue
+
+        flash_target_disk || true
+        [ "$RETRY_REQUESTED" = true ] && continue
+
+        show_completion_screen
+        break
+    done
 }
 
 main "$@"
