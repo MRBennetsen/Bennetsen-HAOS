@@ -82,7 +82,7 @@ jobs:
           fi
 
           # Find previous tag to collect commits since last release
-          PREV_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -n 1 || true)
+          PREV_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | sed -n '1p' || true)
           TAG_MSG=$(git tag -l --format='%(contents)' "${CURRENT_TAG}" 2>/dev/null || true)
 
           if [ -n "$PREV_TAG" ]; then

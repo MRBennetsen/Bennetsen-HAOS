@@ -89,15 +89,17 @@ fetch_apk_static() {
     mkdir -p "$TOOLS_DIR"
     local index_file="${TOOLS_DIR}/APKINDEX.tar.gz"
     curl -fsSL "${ALPINE_MIRROR}/${ALPINE_VERSION}/main/${ARCH}/APKINDEX.tar.gz" -o "$index_file"
+    tar -xzf "$index_file" -C "$TOOLS_DIR" APKINDEX
 
     local apk_ver
-    apk_ver=$(tar -xzO -f "$index_file" APKINDEX | awk '/^P:apk-tools-static$/{p=1} p && /^V:/{sub(/^V:/,""); print; exit}')
+    apk_ver=$(awk '/^P:apk-tools-static$/{p=1} p && /^V:/{sub(/^V:/,""); print; exit}' "${TOOLS_DIR}/APKINDEX")
     [ -n "$apk_ver" ] || err "Could not determine apk-tools-static version from Alpine APKINDEX."
 
     local apk_pkg="apk-tools-static-${apk_ver}.apk"
     log "Downloading ${apk_pkg}..."
     curl -fsSL "${ALPINE_MIRROR}/${ALPINE_VERSION}/main/${ARCH}/${apk_pkg}" -o "${TOOLS_DIR}/${apk_pkg}"
-    tar -xzf "${TOOLS_DIR}/${apk_pkg}" -C "$TOOLS_DIR" sbin/apk.static
+    tar -xzf "${TOOLS_DIR}/${apk_pkg}" -C "$TOOLS_DIR" sbin/apk.static 2>/dev/null || true
+    [ -x "${TOOLS_DIR}/sbin/apk.static" ] || err "Failed to extract sbin/apk.static from ${apk_pkg}."
     chmod +x "${TOOLS_DIR}/sbin/apk.static"
     ok "apk.static (${apk_ver}) ready."
 }
@@ -106,8 +108,22 @@ fetch_apk_static() {
 # "Grabbing packages - injecting Linux networking and disk magic into RAM"
 build_rootfs() {
     log "Cleaning previous workspace in ${WORK_DIR}..."
+    cleanup
     rm -rf "$ROOTFS_DIR" "$ISO_DIR"
     mkdir -p "$ROOTFS_DIR" "$ISO_DIR"
+    mkdir -p "${ROOTFS_DIR}/etc/mkinitfs" "${ROOTFS_DIR}/proc" "${ROOTFS_DIR}/sys" "${ROOTFS_DIR}/dev"
+
+    # Disable Alpine's mkinitfs trigger so it doesn't build a redundant initramfs during install;
+    # configure DNS upfront for chroot tasks and target live network fallback.
+    echo 'disable_trigger="yes"' > "${ROOTFS_DIR}/etc/mkinitfs/mkinitfs.conf"
+    cat > "${ROOTFS_DIR}/etc/resolv.conf" << 'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+
+    mount --bind /proc "${ROOTFS_DIR}/proc"
+    mount --bind /sys "${ROOTFS_DIR}/sys"
+    mount --bind /dev "${ROOTFS_DIR}/dev"
 
     log "Bootstrapping Alpine ${ALPINE_VERSION} (${ARCH}) root filesystem..."
     "${TOOLS_DIR}/sbin/apk.static" \
@@ -186,31 +202,29 @@ build_rootfs() {
 
     # Extract kernel & generate module dependencies inside chroot
     local kver
-    kver=$(ls "${ROOTFS_DIR}/lib/modules" | head -n 1)
+    kver=$(ls "${ROOTFS_DIR}/lib/modules" | sed -n '1p')
     [ -n "$kver" ] || err "Kernel modules directory not found in rootfs!"
     log "Detected Alpine LTS kernel version: ${kver}"
 
-    # Configure DNS for chroot tasks and target live network fallback
-    cat > "${ROOTFS_DIR}/etc/resolv.conf" << 'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
-
+    chroot "$ROOTFS_DIR" /bin/busybox --install -s 2>/dev/null || true
     chroot "$ROOTFS_DIR" /sbin/depmod -a "$kver"
     chroot "$ROOTFS_DIR" /usr/sbin/update-ca-certificates 2>/dev/null || true
+
+    # Unmount pseudo-filesystems right after chroot work so cpio never traverses host mounts
+    cleanup
 
     # Fallback: ensure gum is executable; if apk gum wasn't installed, fetch static binary from Charmbracelet
     if [ ! -x "${ROOTFS_DIR}/usr/bin/gum" ] && [ ! -x "${ROOTFS_DIR}/usr/local/bin/gum" ]; then
         warn "gum binary missing from apk; downloading static release from GitHub..."
         local gum_url
         gum_url=$(curl -fsSL https://api.github.com/repos/charmbracelet/gum/releases/latest \
-            | jq -r '.assets[] | select(.name | test("Linux_x86_64\\.tar\\.gz$")) | .browser_download_url' | head -n 1)
+            | jq -r '[.assets[] | select(.name | test("Linux_x86_64\\.tar\\.gz$")) | .browser_download_url][0] // empty')
         if [ -n "$gum_url" ]; then
             curl -fsSL "$gum_url" -o "${TOOLS_DIR}/gum.tar.gz"
             mkdir -p "${TOOLS_DIR}/gum_ext"
             tar -xzf "${TOOLS_DIR}/gum.tar.gz" -C "${TOOLS_DIR}/gum_ext"
             local gum_bin
-            gum_bin=$(find "${TOOLS_DIR}/gum_ext" -type f -name gum | head -n 1)
+            gum_bin=$(find "${TOOLS_DIR}/gum_ext" -type f -name gum | sed -n '1p')
             [ -n "$gum_bin" ] && install -m 0755 "$gum_bin" "${ROOTFS_DIR}/usr/local/bin/gum"
         fi
     fi
