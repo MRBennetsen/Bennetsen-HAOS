@@ -325,6 +325,9 @@ fi
 [ -c /dev/null ]    || mknod -m 666 /dev/null c 1 3
 [ -c /dev/tty1 ]    || mknod -m 620 /dev/tty1 c 4 1
 
+# Explicitly load simpledrm so simple-framebuffer takes over tty1 immediately
+modprobe -q simpledrm 2>/dev/null || true
+
 hostname -F /etc/hostname 2>/dev/null || hostname easy-haos
 
 echo "[Easy-HAOS] Loading hardware & storage drivers..." >/dev/tty1 2>/dev/null || true
@@ -335,7 +338,7 @@ udevadm trigger --type=subsystems --action=add 2>/dev/null || true
 udevadm trigger --type=devices --action=add 2>/dev/null || true
 udevadm settle --timeout=10 2>/dev/null || true
 
-for mod in nvme ahci sd_mod usb_storage uas usbhid hid_generic efivarfs vfat ext4 nls_cp437 nls_utf8; do
+for mod in simpledrm nvme ahci sd_mod usb_storage uas usbhid hid_generic efivarfs vfat ext4 nls_cp437 nls_utf8; do
     modprobe -q "$mod" 2>/dev/null || true
 done
 find /sys/devices -name modalias -print0 2>/dev/null | xargs -0 sort -u 2>/dev/null | xargs -r modprobe -abq 2>/dev/null || true
