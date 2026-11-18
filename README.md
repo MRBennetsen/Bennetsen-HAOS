@@ -5,7 +5,7 @@
 [![Build & Release Easy-HAOS ISO](https://github.com/MRBennetsen/Bennetsen-HAOS/actions/workflows/release-iso.yml/badge.svg)](https://github.com/MRBennetsen/Bennetsen-HAOS/actions/workflows/release-iso.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Easy-HAOS** is a lightweight (<200 MB), foolproof, bootable USB Auto-Installer ISO for installing **Home Assistant OS (HAOS) Generic x86-64** directly onto bare-metal Mini PCs — such as Intel N100 boxes, Intel NUCs, Lenovo ThinkCentre Tiny (M73/M93p/M720q), Dell OptiPlex Micro, HP EliteDesk Mini, and custom x86-64 servers.
+**Easy-HAOS** is a lightweight (~230 MB / <250 MB), foolproof, bootable USB Auto-Installer ISO for installing **Home Assistant OS (HAOS) Generic x86-64** directly onto bare-metal Mini PCs — such as Intel N100 boxes, Intel NUCs, Lenovo ThinkCentre Tiny (M73/M93p/M720q), Dell OptiPlex Micro, HP EliteDesk Mini, and custom x86-64 servers.
 
 ---
 
@@ -23,7 +23,7 @@ Installing Home Assistant OS on a generic x86-64 Mini PC traditionally meant:
 
 ## Key Features
 
-- **Lean Pure-UEFI ISO (<200 MB):** Built on Alpine Linux `x86_64` with a self-contained standalone GRUB2 UEFI bootloader (`/EFI/BOOT/BOOTX64.EFI`). No Legacy BIOS/ISOLINUX bloat, and **zero Rufus Syslinux/GRUB download popups** — works seamlessly with **BalenaEtcher**, **Rufus** (ISO or DD mode), and **Ventoy**.
+- **Lean Pure-UEFI ISO (~230 MB / <250 MB):** Built on Alpine Linux `x86_64` with a self-contained standalone GRUB2 UEFI bootloader (`/EFI/BOOT/BOOTX64.EFI`). No Legacy BIOS/ISOLINUX bloat, and **zero Rufus Syslinux/GRUB download popups** — works seamlessly with **BalenaEtcher**, **Rufus** (ISO or DD mode), and **Ventoy**.
 - **Animated Appliance TUI & `[ ✓ ]` / `[ ✗ ]` Diagnostics:**
   - Persistent 5-step wizard bar (`1.Pre-Flight → 2.Release → 3.Disk → 4.Flash → 5.Done`) with animated spinners and a live **System Pre-Flight & Diagnostics** status card.
   - Structured red **`[ ✗ ]`** diagnostic error cards that show exact failure details, captured logs, and one-click recovery options (`Retry Installation Wizard`, `Configure Network / Wi-Fi`, `Open Diagnostic Shell`, or `Reboot Machine`).
@@ -34,8 +34,8 @@ Installing Home Assistant OS on a generic x86-64 Mini PC traditionally meant:
 - **Smart HAOS Release Resolution + Offline Bonus:**
   - Queries the [Home Assistant OS GitHub Releases API](https://api.github.com/repos/home-assistant/operating-system/releases?per_page=10), automatically skipping board-specific hotfix releases (such as Raspberry Pi/Yellow-only point releases like `18.5`) to locate the newest release containing `haos_generic-x86-64-*.img.xz`, and verifies the asset URL (`curl -fsIL`) **before** touching any disk.
   - **Offline Bonus:** Drop any `haos_generic-x86-64-*.img.xz` file onto your Ventoy data partition or USB stick (`exFAT`/`NTFS`/`FAT32`/`ext4`) and Easy-HAOS detects it automatically for offline installs.
-- **Foolproof Target Protection:** Dynamically detects the running boot USB stick (via mount source, `EASY_HAOS` / `Ventoy` labels, and the `.easy-haos-usb` marker file) and removes it from the target drive list. Requires typing `YES` in uppercase before touching a single sector.
-- **Live Flashing Dashboard & UEFI Verification:** Streams `curl | pv | xz -d | dd` straight onto your NVMe/SSD inside a 4-stage flashing card, followed by `partprobe` and `efibootmgr` NVRAM boot-order verification.
+- **Foolproof Target Protection & SSD S.M.A.R.T. Health Check:** Dynamically detects the running boot USB stick (via mount source, `EASY_HAOS` / `Ventoy` labels, and the `.easy-haos-usb` marker file) and removes it from the target drive list. Runs `smartctl` on internal drives to show temperature, wear level, power-on hours, and bad-sector warnings (catching dying used Mini PC SSDs before install), and requires typing `YES` in uppercase before touching a single sector.
+- **Live Flashing Dashboard, UEFI Verification & Phone QR Code:** Streams `curl | pv | xz -d | dd` straight onto your NVMe/SSD inside a 4-stage flashing card, followed by `partprobe` and `efibootmgr` NVRAM boot-order verification. On completion, renders a scannable **terminal QR code (`qrencode`)** directly to `http://<LAN_IP>:8123` (or `http://homeassistant.local:8123`) so you can open onboarding right from your phone camera.
 
 ---
 

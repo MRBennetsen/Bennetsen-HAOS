@@ -171,7 +171,9 @@ EOF
         wireless-tools \
         ca-certificates \
         kbd \
-        kbd-misc
+        kbd-misc \
+        smartmontools \
+        libqrencode-tools
 
     ok "Alpine rootfs packages installed."
 

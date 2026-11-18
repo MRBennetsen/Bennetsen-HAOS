@@ -955,6 +955,70 @@ is_protected_disk() {
     return 1
 }
 
+# Inspect SSD/NVMe S.M.A.R.T. health so buyers of refurbished Mini PCs catch dying drives early
+inspect_disk_smart() {
+    local dev_path="$1"
+    SMART_SHORT_TAG="SMART: N/A"
+    SMART_DETAIL_LINE="${C_DIM}Unsupported or Virtual Disk${C_RESET}"
+    SMART_IS_UNHEALTHY=false
+
+    command -v smartctl >/dev/null 2>&1 || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    local sjson
+    sjson=$(smartctl -j -H -A "$dev_path" 2>/dev/null || true)
+    [ -z "$sjson" ] && return 0
+
+    local passed temp hours realloc pending nvme_used nvme_err
+    passed=$(echo "$sjson" | jq -r 'if .smart_status.passed == null then empty else .smart_status.passed end' 2>/dev/null || true)
+    [ -z "$passed" ] && return 0
+
+    temp=$(echo "$sjson" | jq -r '.temperature.current // empty' 2>/dev/null || true)
+    hours=$(echo "$sjson" | jq -r '.power_on_time.hours // empty' 2>/dev/null || true)
+    realloc=$(echo "$sjson" | jq -r '[.ata_smart_attributes.table[]? | select(.id == 5) | .raw.value][0] // empty' 2>/dev/null || true)
+    pending=$(echo "$sjson" | jq -r '[.ata_smart_attributes.table[]? | select(.id == 197) | .raw.value][0] // empty' 2>/dev/null || true)
+    nvme_used=$(echo "$sjson" | jq -r '.nvme_smart_health_information_log.percentage_used // empty' 2>/dev/null || true)
+    nvme_err=$(echo "$sjson" | jq -r '.nvme_smart_health_information_log.media_errors // empty' 2>/dev/null || true)
+
+    local bad_sectors=0
+    [[ "$realloc" =~ ^[0-9]+$ ]] && [ "$realloc" -gt 0 ] && bad_sectors=$((bad_sectors + realloc))
+    [[ "$pending" =~ ^[0-9]+$ ]] && [ "$pending" -gt 0 ] && bad_sectors=$((bad_sectors + pending))
+    [[ "$nvme_err" =~ ^[0-9]+$ ]] && [ "$nvme_err" -gt 0 ] && bad_sectors=$((bad_sectors + nvme_err))
+
+    local metrics=""
+    if [ -n "$nvme_used" ] && [[ "$nvme_used" =~ ^[0-9]+$ ]]; then
+        local life_left=$((100 - nvme_used))
+        [ "$life_left" -lt 0 ] && life_left=0
+        metrics+="${life_left}% life left"
+    fi
+    if [ -n "$temp" ] && [[ "$temp" =~ ^-?[0-9]+$ ]]; then
+        [ -n "$metrics" ] && metrics+=", "
+        metrics+="${temp}°C"
+    fi
+    if [ -n "$hours" ] && [[ "$hours" =~ ^[0-9]+$ ]]; then
+        [ -n "$metrics" ] && metrics+=", "
+        metrics+="${hours}h on"
+    fi
+
+    if [ "$passed" = "false" ] || [ "$bad_sectors" -gt 0 ] || ( [[ "$nvme_used" =~ ^[0-9]+$ ]] && [ "$nvme_used" -ge 90 ] ); then
+        SMART_IS_UNHEALTHY=true
+        if [ "$passed" = "false" ]; then
+            SMART_SHORT_TAG="SMART: FAILED!"
+            SMART_DETAIL_LINE="${C_RED}${C_BOLD}FAILED${C_RESET}"
+        else
+            SMART_SHORT_TAG="SMART: WARN!"
+            SMART_DETAIL_LINE="${C_YELLOW}${C_BOLD}WARNING${C_RESET}"
+        fi
+        [ "$bad_sectors" -gt 0 ] && SMART_DETAIL_LINE+=" ${C_RED}(${bad_sectors} bad/media error(s))${C_RESET}"
+        [ -n "$metrics" ] && SMART_DETAIL_LINE+=" ${C_DIM}[${metrics}]${C_RESET}"
+    else
+        SMART_SHORT_TAG="SMART: OK"
+        [ -n "$temp" ] && [[ "$temp" =~ ^-?[0-9]+$ ]] && SMART_SHORT_TAG="SMART: OK ${temp}°C"
+        SMART_DETAIL_LINE="${C_GREEN}${C_BOLD}PASSED${C_RESET}"
+        [ -n "$metrics" ] && SMART_DETAIL_LINE+=" ${C_DIM}(${metrics})${C_RESET}"
+    fi
+}
+
 select_target_disk() {
     DIAG_USB_ST="running"; DIAG_USB_MSG="Scanning block devices & USB markers..."
     print_banner 3
@@ -990,8 +1054,10 @@ select_target_disk() {
             d_model=$(lsblk -d -n -o MODEL "/dev/${d_name}" 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//' || echo "Generic Drive")
             [ -z "$d_model" ] && d_model="Generic Storage Device"
 
+            inspect_disk_smart "/dev/${d_name}"
+
             disk_list+=("$d_name")
-            disk_display+=("$(printf '/dev/%-8s | %7s | [%-4s] %s' "$d_name" "$d_size" "$d_tran" "$d_model")")
+            disk_display+=("$(printf '/dev/%-8s | %7s | [%-4s] %-24.24s | %s' "$d_name" "$d_size" "$d_tran" "$d_model" "$SMART_SHORT_TAG")")
         done <<< "$raw_disks"
 
         if [ ${#disk_list[@]} -eq 0 ]; then
@@ -1025,6 +1091,7 @@ select_target_disk() {
         TARGET_SIZE=$(lsblk -d -n -o SIZE "/dev/${TARGET_DISK}" 2>/dev/null | tr -d '[:space:]')
         TARGET_MODEL=$(lsblk -d -n -o MODEL "/dev/${TARGET_DISK}" 2>/dev/null | sed 's/^[ \t]*//;s/[ \t]*$//')
         [ -z "$TARGET_MODEL" ] && TARGET_MODEL="Unknown Model"
+        inspect_disk_smart "/dev/${TARGET_DISK}"
 
         # Explicit Confirmation Card
         # Wiping partition tables - "Say goodbye to Windows 11 bloatware. No regrets."
@@ -1035,7 +1102,13 @@ select_target_disk() {
         warn_body+="  Target Device : ${C_WHITE}${C_BOLD}/dev/${TARGET_DISK}${C_RESET}\n"
         warn_body+="  Disk Model    : ${C_WHITE}${C_BOLD}${TARGET_MODEL}${C_RESET}\n"
         warn_body+="  Capacity      : ${C_WHITE}${C_BOLD}${TARGET_SIZE}${C_RESET}\n"
+        warn_body+="  Drive Health  : ${SMART_DETAIL_LINE}\n"
         warn_body+="  Installing    : ${C_GREEN}${C_BOLD}Home Assistant OS v${HAOS_VERSION}${C_RESET}"
+
+        if [ "$SMART_IS_UNHEALTHY" = true ]; then
+            warn_body+="\n\n${C_YELLOW}${C_BOLD}[ ! ] SMART HEALTH ALERT: This drive reports wear or bad sectors.${C_RESET}"
+            warn_body+="\n${C_YELLOW}Consider replacing this SSD if you plan a long-term HAOS setup.${C_RESET}"
+        fi
 
         ui_card "196" "[ ! ] FINAL DESTRUCTIVE CONFIRMATION" "$(echo -e "$warn_body")" "double"
         echo ""
@@ -1257,6 +1330,17 @@ show_completion_screen() {
     done_body+="${C_DIM}LinkedIn: https://www.linkedin.com/in/mrbennetsen/${C_RESET}"
 
     ui_card "46" "[ ✓ ] INSTALLATION COMPLETE" "$(echo -e "$done_body")" "double"
+
+    if command -v qrencode >/dev/null 2>&1; then
+        local first_ip
+        first_ip=$(echo "$ips" | sed -n '1p')
+        local qr_url="http://homeassistant.local:8123"
+        [ -n "$first_ip" ] && qr_url="http://${first_ip}:8123"
+
+        echo -e "  ${C_CYAN}${C_BOLD}Scan with your phone camera → ${C_WHITE}${qr_url}${C_RESET}"
+        (qrencode -t ANSIUTF8 -m 2 -l L "$qr_url" 2>/dev/null || qrencode -t UTF8 -m 2 -l L "$qr_url" 2>/dev/null || true) \
+            | sed 's/^/    /'
+    fi
     echo ""
 
     while true; do
