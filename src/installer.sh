@@ -83,7 +83,8 @@ fatal_error() {
     echo -e "${C_YELLOW}Press [ENTER] to drop to an emergency shell, or type 'reboot' to restart.${C_RESET}"
     read -r reply
     if [[ "${reply,,}" == "reboot" ]]; then
-        reboot
+        sync
+        reboot -f
     fi
     exec /bin/bash
 }
@@ -202,12 +203,14 @@ EOF
             case "${choice,,}" in
                 reboot)
                     echo -e "${C_YELLOW}Rebooting so you can switch BIOS to UEFI...${C_RESET}"
-                    reboot || poweroff || halt
+                    sync
+                    reboot -f || poweroff -f || halt -f
                     exit 1
                     ;;
                 poweroff|halt)
                     echo -e "${C_YELLOW}Powering off safely...${C_RESET}"
-                    poweroff || halt
+                    sync
+                    poweroff -f || halt -f
                     exit 1
                     ;;
                 shell)
@@ -269,7 +272,8 @@ check_secure_boot() {
                 if [ -w /sys/firmware/efi/efivars/OsIndications-8be4df61-93ca-11d2-aa0d-00e098032b8c ]; then
                     echo -e "${C_DIM}(Rebooting now — press Del/F2/F10 if firmware does not open automatically)${C_RESET}"
                 fi
-                reboot
+                sync
+                reboot -f
                 exit 0
                 ;;
             "Continue anyway"*)
@@ -284,10 +288,27 @@ check_secure_boot() {
     fi
 }
 
+CLOCK_SYNCED=false
+
+# Sync system clock on older Mini PCs with dead CMOS batteries so HTTPS TLS checks succeed
+sync_system_clock() {
+    [ "$CLOCK_SYNCED" = true ] && return 0
+    if command -v ntpd >/dev/null 2>&1; then
+        timeout 4 ntpd -q -n -p time.cloudflare.com >/dev/null 2>&1 \
+            || timeout 4 ntpd -q -n -p pool.ntp.org >/dev/null 2>&1 \
+            || true
+    fi
+    CLOCK_SYNCED=true
+}
+
 # Helper to verify connectivity
 has_internet() {
-    (ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1) && \
+    if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 || ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+        sync_system_clock
         curl -Is --connect-timeout 4 https://api.github.com >/dev/null 2>&1
+    else
+        return 1
+    fi
 }
 
 # Trigger DHCP across wired interfaces
@@ -307,7 +328,7 @@ renew_ethernet_dhcp() {
 setup_wifi_connection() {
     echo -e "${C_CYAN}[*] Searching for Wi-Fi hardware...${C_RESET}"
     local wlan_dev
-    wlan_dev=$(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(wl|wlan)' | head -n 1 || true)
+    wlan_dev=$(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -E '^(wl|wlan)' | sed -n '1p' || true)
 
     if [ -z "$wlan_dev" ]; then
         echo -e "${C_RED}[!] No wireless network adapter detected.${C_RESET}"
@@ -499,7 +520,8 @@ check_network() {
                 return 0
                 ;;
             "Reboot Machine")
-                reboot
+                sync
+                reboot -f
                 ;;
         esac
     done
@@ -525,7 +547,7 @@ fetch_haos_release() {
     # Mount unmounted partitions read-only temporarily to check for Ventoy/USB offline images
     for blk in $(lsblk -lno PATH,TYPE 2>/dev/null | awk '$2=="part" {print $1}'); do
         local existing_mnt
-        existing_mnt=$(findmnt -n -o TARGET "$blk" 2>/dev/null | head -n 1 || true)
+        existing_mnt=$(findmnt -n -o TARGET "$blk" 2>/dev/null | sed -n '1p' || true)
         if [ -z "$existing_mnt" ]; then
             if mount -o ro "$blk" "$scan_dir" 2>/dev/null; then
                 while IFS= read -r f; do
@@ -567,7 +589,7 @@ fetch_haos_release() {
         if [ "$chosen_file" != "Download Latest Official Release from GitHub API" ] && [ -f "$chosen_file" ]; then
             HAOS_IMAGE_FILE="$chosen_file"
             IS_OFFLINE_IMAGE=true
-            HAOS_VERSION=$(basename "$chosen_file" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || echo "Offline")
+            HAOS_VERSION=$(basename "$chosen_file" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | sed -n '1p' || echo "Offline")
             echo -e "${C_GREEN}[✓] Selected local image: ${HAOS_IMAGE_FILE} (v${HAOS_VERSION})${C_RESET}"
             sleep 1
             return 0
@@ -581,8 +603,8 @@ fetch_haos_release() {
 
     if [ -n "$api_resp" ] && command -v jq >/dev/null 2>&1; then
         HAOS_VERSION=$(echo "$api_resp" | jq -r '.tag_name // empty')
-        HAOS_DOWNLOAD_URL=$(echo "$api_resp" | jq -r '.assets[] | select(.name | test("^haos_generic-x86-64-.*\\.img\\.xz$")) | .browser_download_url' | head -n 1)
-        HAOS_ASSET_SIZE=$(echo "$api_resp" | jq -r '.assets[] | select(.name | test("^haos_generic-x86-64-.*\\.img\\.xz$")) | .size // empty' | head -n 1)
+        HAOS_DOWNLOAD_URL=$(echo "$api_resp" | jq -r '[.assets[] | select(.name | test("^haos_generic-x86-64-.*\\.img\\.xz$")) | .browser_download_url][0] // empty')
+        HAOS_ASSET_SIZE=$(echo "$api_resp" | jq -r '[.assets[] | select(.name | test("^haos_generic-x86-64-.*\\.img\\.xz$")) | .size][0] // empty')
     fi
 
     # Fallback redirect resolution if GitHub API rate limit was hit
@@ -652,7 +674,7 @@ detect_boot_device() {
     mkdir -p "$probe_dir"
     for blk in $(lsblk -lno PATH,TYPE 2>/dev/null | awk '$2=="part" {print $1}'); do
         local mnt_pt
-        mnt_pt=$(findmnt -n -o TARGET "$blk" 2>/dev/null | head -n 1 || true)
+        mnt_pt=$(findmnt -n -o TARGET "$blk" 2>/dev/null | sed -n '1p' || true)
         if [ -n "$mnt_pt" ]; then
             if [ -f "${mnt_pt}/.easy-haos-usb" ]; then
                 add_protected_disk "$blk"
@@ -882,7 +904,7 @@ flash_target_disk() {
         # Create fresh entry (efibootmgr -c places the new entry at the top of BootOrder by default)
         if efibootmgr -c -d "${dev}" -p 1 -L "Home Assistant OS" -l '\EFI\BOOT\bootx64.efi' >/dev/null 2>&1; then
             local new_bootnum
-            new_bootnum=$(efibootmgr 2>/dev/null | grep -i "Home Assistant OS" | head -n 1 | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')
+            new_bootnum=$(efibootmgr 2>/dev/null | grep -i "Home Assistant OS" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' | sed -n '1p')
             if [ -n "$new_bootnum" ]; then
                 local current_order
                 current_order=$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p' | tr -d '[:space:]')
@@ -963,7 +985,7 @@ EOF
     read -r
     echo -e "${C_GREEN}[*] Rebooting into Home Assistant OS... Enjoy your smart home!${C_RESET}"
     sync
-    reboot
+    reboot -f
 }
 
 # ==============================================================================

@@ -227,6 +227,7 @@ EOF
             "${kmod_dir}/drivers/isdn" \
             "${kmod_dir}/drivers/staging" \
             "${kmod_dir}/sound" \
+            "${kmod_dir}/drivers/bluetooth" \
             "${kmod_dir}/net/bluetooth" \
             "${kmod_dir}/fs/ceph" \
             "${kmod_dir}/fs/smb" \
@@ -305,6 +306,10 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 export TERM=linux
 
+# Handle BusyBox reboot/poweroff signals cleanly as PID 1
+trap 'sync; /sbin/reboot -f' USR2 TERM INT
+trap 'sync; /sbin/poweroff -f' USR1
+
 # 1. Mount core kernel filesystems
 mount -t proc proc /proc 2>/dev/null || true
 mount -t sysfs sysfs /sys 2>/dev/null || true
@@ -338,7 +343,7 @@ udevadm trigger --type=subsystems --action=add 2>/dev/null || true
 udevadm trigger --type=devices --action=add 2>/dev/null || true
 udevadm settle --timeout=10 2>/dev/null || true
 
-for mod in simpledrm nvme ahci sd_mod usb_storage uas usbhid hid_generic efivarfs vfat ext4 nls_cp437 nls_utf8; do
+for mod in simpledrm nvme ahci sd_mod usb_storage uas usbhid hid_generic efivarfs vfat exfat ntfs3 isofs ext4 nls_cp437 nls_utf8; do
     modprobe -q "$mod" 2>/dev/null || true
 done
 find /sys/devices -name modalias -print0 2>/dev/null | xargs -0 sort -u 2>/dev/null | xargs -r modprobe -abq 2>/dev/null || true
@@ -351,9 +356,10 @@ for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@'
 done
 dhcpcd -b -q >/dev/null 2>&1 || true
 
-# 4. Run Easy-HAOS interactive installer on tty1 in a non-exiting PID 1 loop
+# 4. Suppress noisy console kernel logs and run Easy-HAOS TUI on tty1 in a non-exiting PID 1 loop
+echo 1 > /proc/sys/kernel/printk 2>/dev/null || true
 while true; do
-    setsid cttyhack /usr/local/bin/easy-haos-autostart.sh </dev/tty1 >/dev/tty1 2>&1 || true
+    setsid -c /usr/local/bin/easy-haos-autostart.sh </dev/tty1 >/dev/tty1 2>&1 || /usr/local/bin/easy-haos-autostart.sh </dev/tty1 >/dev/tty1 2>&1 || true
     sleep 1
 done
 EOF

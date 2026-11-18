@@ -30,8 +30,8 @@ while true; do
     echo "======================================================================"
     echo " Easy-HAOS Installer exited."
     echo "  • Type 'installer' to restart the installer."
-    echo "  • Type 'reboot' to restart the machine."
-    echo "  • Type 'poweroff' to shut down."
+    echo "  • Type 'reboot -f' to restart the machine."
+    echo "  • Type 'poweroff -f' to shut down."
     echo "======================================================================"
     echo ""
     /bin/bash --login
