@@ -193,14 +193,31 @@ EOF
         echo -e "  4. Save & Exit (${C_CYAN}F10${C_RESET}) and boot from the ${C_CYAN}UEFI:${C_RESET} entry for this USB drive.\n"
         echo -e "${C_DIM}Need help? Visit https://bennetsen.dk or youtube.com/@BennetsenTech${C_RESET}\n"
 
-        echo -ne "${C_YELLOW}Press [ENTER] to power off / reboot, or type 'shell' for bash: ${C_RESET}"
-        read -r choice
-        if [[ "${choice,,}" == "shell" ]]; then
-            exec /bin/bash
-        fi
-        echo -e "${C_YELLOW}Halting safely so you can switch BIOS to UEFI...${C_RESET}"
-        reboot || poweroff || halt
-        exit 1
+        while true; do
+            echo -ne "${C_YELLOW}Type 'reboot', 'poweroff', or 'shell': ${C_RESET}"
+            if ! read -r choice; then
+                sleep 1
+                continue
+            fi
+            case "${choice,,}" in
+                reboot)
+                    echo -e "${C_YELLOW}Rebooting so you can switch BIOS to UEFI...${C_RESET}"
+                    reboot || poweroff || halt
+                    exit 1
+                    ;;
+                poweroff|halt)
+                    echo -e "${C_YELLOW}Powering off safely...${C_RESET}"
+                    poweroff || halt
+                    exit 1
+                    ;;
+                shell)
+                    exec /bin/bash
+                    ;;
+                *)
+                    echo -e "${C_RED}Please type 'reboot', 'poweroff', or 'shell'.${C_RESET}"
+                    ;;
+            esac
+        done
     fi
     echo -e "${C_GREEN}[✓] UEFI Mode verified (/sys/firmware/efi present).${C_RESET}"
 }

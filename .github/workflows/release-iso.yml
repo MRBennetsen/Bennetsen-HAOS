@@ -42,10 +42,13 @@ jobs:
           sudo apt-get install -y -qq \
             xorriso \
             mtools \
+            dosfstools \
             grub2-common \
-            grub-pc-bin \
             grub-efi-amd64-bin \
+            isolinux \
+            syslinux-common \
             cpio \
+            gzip \
             xz-utils \
             curl \
             jq \
